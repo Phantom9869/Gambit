@@ -3,11 +3,11 @@
 import argparse
 import sys
 
-from gambit.modules import baseline_headers
+from gambit.modules import baseline_headers, exposed_files
 from gambit.triage import to_json, to_text
 
 # Add new modules here as they are written.
-MODULES = [baseline_headers]
+MODULES = [baseline_headers, exposed_files]
 
 
 def main(argv=None) -> int:

@@ -2,12 +2,11 @@
 
 import requests
 
+from gambit.http import TIMEOUT, USER_AGENT, get
 from gambit.models import Finding, Severity
 
-USER_AGENT = (
-    "GAMBIT/0.1 (+https://github.com/Phantom9869/gambit; authorized testing only)"
-)
-TIMEOUT = 10  # seconds
+# Re-exported for backwards compatibility; canonical values live in gambit.http.
+__all__ = ["EXPECTED_HEADERS", "USER_AGENT", "TIMEOUT", "check_headers", "run"]
 
 # header name (lowercase) -> (severity if missing, why it matters, next step)
 # Severities are judgment calls; adjust them as you learn more.
@@ -71,9 +70,8 @@ def run(target: str) -> list[Finding]:
     """Fetch the target over HTTPS and check its security headers."""
     url = f"https://{target}"
     try:
-        response = requests.get(
+        response = get(
             url,
-            headers={"User-Agent": USER_AGENT},
             timeout=TIMEOUT,
             allow_redirects=True,
         )

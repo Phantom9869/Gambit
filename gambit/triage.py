@@ -26,6 +26,27 @@ def to_text(findings: list[Finding]) -> str:
     return "\n\n".join(blocks)
 
 
+def to_markdown(findings: list[Finding]) -> str:
+    """Markdown report, most severe findings first.
+
+    Table-free: a heading per finding in the README example style
+    (``[SEVERITY] host: title``) followed by Evidence/Why/Next bullets,
+    so the report reads well pasted into notes or an issue.
+    """
+    if not findings:
+        return "# GAMBIT report\n\nNo findings."
+
+    blocks = ["# GAMBIT report"]
+    for f in rank(findings):
+        blocks.append(
+            f"## [{f.severity.name}] {f.host}: {f.title}\n\n"
+            f"- **Evidence:** {f.evidence}\n"
+            f"- **Why:** {f.why}\n"
+            f"- **Next:** {f.next_step}"
+        )
+    return "\n\n".join(blocks)
+
+
 def to_json(findings: list[Finding]) -> str:
     """Machine-readable report for pipelines."""
     return json.dumps([f.to_dict() for f in rank(findings)], indent=2)

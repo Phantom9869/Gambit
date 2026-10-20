@@ -7,12 +7,12 @@ from typing import Callable, Optional
 
 import requests
 
+from gambit.http import TIMEOUT, USER_AGENT, get
 from gambit.models import Finding, Severity
 
-USER_AGENT = (
-    "GAMBIT/0.1 (+https://github.com/Phantom9869/Gambit; authorized testing only)"
-)
-TIMEOUT = 10  # seconds
+# Re-exported for backwards compatibility; canonical values live in gambit.http.
+__all__ = ["CHECKS", "Check", "DELAY", "MAX_BYTES", "TIMEOUT", "USER_AGENT", "evaluate", "run"]
+
 MAX_BYTES = 512  # enough to recognize a file; never download more
 DELAY = 0.5  # seconds between requests, so we stay polite
 
@@ -31,6 +31,31 @@ def _is_env_file(body: str) -> bool:
 
 def _is_robots_txt(body: str) -> bool:
     return "user-agent:" in body.lower() and "<html" not in body.lower()
+
+
+def _is_git_config(body: str) -> bool:
+    """A real .git/config has a [core] section, and is not an HTML page."""
+    if "<html" in body.lower():
+        return False
+    return re.search(r"^\[core\]", body, re.MULTILINE) is not None
+
+
+def _is_ds_store(body: str) -> bool:
+    """A real .DS_Store starts with four bytes then the 'Bud1' magic.
+
+    Those leading bytes survive the lossy UTF-8 decode in run() as control
+    characters, so the magic still sits at offset 4. Accepting it at offset
+    0 too keeps the matcher usable on a body that lost its leading bytes.
+    """
+    return body.startswith("Bud1") or body[4:8] == "Bud1"
+
+
+def _is_directory_listing(body: str) -> bool:
+    """Apache/nginx/lighttpd autoindex pages title themselves 'Index of /...'."""
+    lowered = body.lower()
+    if "<title>index of /" not in lowered:
+        return False
+    return "<h1>index of /" in lowered or "parent directory" in lowered
 
 
 @dataclass(frozen=True)
@@ -68,6 +93,32 @@ CHECKS = [
         why="Disallow rules often point at admin panels and other areas the owner hoped to hide.",
         next_step="Read the Disallow entries and note any paths worth a closer look.",
     ),
+    Check(
+        path="/.git/config",
+        severity=Severity.HIGH,
+        matches=_is_git_config,
+        title="Git config exposed (/.git/config)",
+        why="A readable .git/config confirms the .git directory is exposed and may reveal the origin remote URL. Source code and history may be recoverable.",
+        next_step="Confirm manually and check commit history for credentials. Report it; do not mirror the repo.",
+    ),
+    Check(
+        path="/.DS_Store",
+        severity=Severity.LOW,
+        matches=_is_ds_store,
+        title=".DS_Store file exposed (/.DS_Store)",
+        why="A .DS_Store file can disclose directory and file names the owner did not intend to publish.",
+        next_step="Note any filenames it reveals and check whether those paths are also reachable.",
+    ),
+] + [
+    Check(
+        path=directory,
+        severity=Severity.LOW,
+        matches=_is_directory_listing,
+        title=f"Directory listing enabled ({directory})",
+        why="The server lists every file in this directory, disclosing filenames and structure that may include backups, uploads, or other sensitive files.",
+        next_step="Confirm manually, note any sensitive filenames, and recommend disabling autoindex/directory listing.",
+    )
+    for directory in ("/uploads/", "/files/", "/images/", "/backup/")
 ]
 
 
@@ -94,9 +145,8 @@ def run(target: str) -> list[Finding]:
     for check in CHECKS:
         url = f"https://{target}{check.path}"
         try:
-            with requests.get(
+            with get(
                 url,
-                headers={"User-Agent": USER_AGENT},
                 timeout=TIMEOUT,
                 allow_redirects=False,
                 stream=True,

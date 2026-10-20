@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gambit"
+version = "0.1.0"
+description = "A small, readable recon-and-triage tool for the first hour of a web pentest."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Kamal Choubey" },
+]
+keywords = ["recon", "pentest", "security", "triage"]
+dependencies = [
+    "requests",
+    "dnspython",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+gambit = "gambit.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/Phantom9869/gambit"
+Repository = "https://github.com/Phantom9869/gambit"
+
+[tool.setuptools.packages.find]
+include = ["gambit*"]
+
+[tool.setuptools.package-data]
+gambit = ["data/*.json"]

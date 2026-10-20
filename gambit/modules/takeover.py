@@ -28,7 +28,7 @@ import dns.exception
 import dns.resolver
 import requests
 
-from gambit.http import TIMEOUT, USER_AGENT, get
+from gambit.http import TIMEOUT, USER_AGENT, get_for_host
 from gambit.models import Finding, Severity
 from gambit.pipeline import normalize_host
 
@@ -282,7 +282,7 @@ def run(target: str) -> list[Finding]:
     status_code = None
     if resolves is not False:
         try:
-            response = get(f"https://{host}", timeout=TIMEOUT, allow_redirects=True)
+            response = get_for_host(host, timeout=TIMEOUT, allow_redirects=True)
         except requests.RequestException:
             body = None
         else:

@@ -11,7 +11,7 @@ from collections.abc import Mapping
 
 import requests
 
-from gambit.http import TIMEOUT, USER_AGENT, get
+from gambit.http import TIMEOUT, USER_AGENT, get_for_host
 from gambit.models import Finding, Severity
 
 # Re-exported for backwards compatibility; canonical values live in gambit.http.
@@ -242,11 +242,10 @@ def identify(host, headers=None, cookies=None, body="") -> list[Finding]:
 
 
 def run(target: str) -> list[Finding]:
-    """Fetch ``/`` over HTTPS once and fingerprint what comes back."""
-    url = f"https://{target}"
+    """Fetch ``/`` once (HTTPS, falling back to HTTP) and fingerprint it."""
     try:
-        response = get(
-            url,
+        response = get_for_host(
+            target,
             timeout=TIMEOUT,
             allow_redirects=True,
         )
@@ -255,10 +254,10 @@ def run(target: str) -> list[Finding]:
             Finding(
                 severity=Severity.INFO,
                 host=target,
-                title="Could not fetch site over HTTPS",
+                title="Could not fetch site",
                 evidence=str(exc),
                 why="The fingerprint check could not run.",
-                next_step="Check the hostname, and whether the site only serves HTTP.",
+                next_step="Check the hostname and whether the site is reachable.",
             )
         ]
     try:

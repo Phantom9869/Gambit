@@ -1,9 +1,10 @@
 """Command-line entry point: python -m gambit example.com
 
-Flow: confirm authorization, run Gather and the takeover check once on
-the apex, discover the (capped) host list, then run the per-host modules
-against every host through :func:`gambit.pipeline.run_pipeline`, and
-finally print the ranked Triage report as text, Markdown, or JSON.
+Flow: confirm authorization, run Gather once on the apex, discover
+the (capped) host list, then run the per-host modules (takeover
+included) against every live host through
+:func:`gambit.pipeline.run_pipeline`, and finally print the ranked
+Triage report as text, Markdown, or JSON.
 """
 
 import argparse
@@ -21,14 +22,23 @@ from gambit.modules import (
     takeover,
     tls,
 )
-from gambit.pipeline import DEFAULT_MAX_HOSTS, discover_hosts, run_for_host, run_pipeline
+from gambit.pipeline import (
+    DEFAULT_MAX_HOSTS,
+    discover_hosts,
+    host_reachable,
+    run_for_host,
+    run_pipeline,
+)
 from gambit.triage import to_json, to_markdown, to_text
 
 # Run once on the apex target, in this order.
-APEX_MODULES = [gather, takeover]
+APEX_MODULES = [gather]
 
-# Run against every discovered host, in this order.
+# Run against every discovered host, in this order. Takeover lives here,
+# not with the apex modules: a dangling CNAME is a subdomain problem,
+# and the apex is the host least likely to have a service CNAME.
 PER_HOST_MODULES = [
+    takeover,
     fingerprint,
     baseline_headers,
     tls,
@@ -37,6 +47,14 @@ PER_HOST_MODULES = [
     exposed_files,
     ports,
 ]
+
+# Web-fetch modules: gated by the liveness pre-flight, because each one
+# can burn a full request timeout on a dead host.
+WEB_MODULES = [fingerprint, baseline_headers, tls, cors, http_methods, exposed_files]
+
+# Non-web modules: must run even when no web port answers -- a dangling
+# CNAME and an open database port are findings precisely on such hosts.
+INFRA_MODULES = [takeover, ports]
 
 # Backwards-compatible alias: the modules run per host.
 MODULES = PER_HOST_MODULES
@@ -71,11 +89,12 @@ def format_report(findings, report_format: str) -> str:
 def collect_findings(target: str, max_hosts: int = DEFAULT_MAX_HOSTS) -> list:
     """Run the full pipeline for ``target`` and return all findings.
 
-    Gather and takeover run once on the apex; host discovery uses
-    Gather's crt.sh subdomain discovery; the per-host modules then run
-    against the discovered (deduped, capped) hosts. Per-module failures
-    are isolated by the pipeline helpers, so one failing check never
-    aborts the scan.
+    Gather runs once on the apex; host discovery uses Gather's crt.sh
+    subdomain discovery (served from Gather's per-process cache, so
+    crt.sh is queried once); the per-host modules -- takeover included --
+    then run against the discovered (deduped, capped) hosts that pass a
+    cheap liveness pre-flight. Per-module failures are isolated by the
+    pipeline helpers, so one failing check never aborts the scan.
     """
     findings = []
     findings.extend(run_for_host(target, APEX_MODULES))
@@ -84,7 +103,16 @@ def collect_findings(target: str, max_hosts: int = DEFAULT_MAX_HOSTS) -> list:
         target, discover=gather.discover_subdomains, max_hosts=max_hosts
     )
     findings.extend(
-        run_pipeline(target, PER_HOST_MODULES, hosts=hosts, max_hosts=max_hosts)
+        run_pipeline(target, INFRA_MODULES, hosts=hosts, max_hosts=max_hosts)
+    )
+    findings.extend(
+        run_pipeline(
+            target,
+            WEB_MODULES,
+            hosts=hosts,
+            max_hosts=max_hosts,
+            preflight=host_reachable,
+        )
     )
     return findings
 

@@ -108,12 +108,16 @@ def evaluate(host: str, port: int) -> Finding:
 
 def run(target: str) -> list[Finding]:
     """Try one TCP connect per port in PORTS and report the open ones."""
+    from gambit.pipeline import split_host_port
+
+    hostname, _explicit_port = split_host_port(target)
+    host = hostname or target
     findings = []
     for port in PORTS:
         try:
-            with socket.create_connection((target, port), timeout=TIMEOUT):
+            with socket.create_connection((host, port), timeout=TIMEOUT):
                 pass  # connected == open; send nothing, read nothing
         except OSError:
             continue  # refused, filtered, timed out, or unresolvable
-        findings.append(evaluate(target, port))
+        findings.append(evaluate(host, port))
     return findings

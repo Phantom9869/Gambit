@@ -25,12 +25,14 @@ def test_reflected_origin_without_credentials_is_med():
     assert one(check_cors("example.com", headers)).severity == Severity.MED
 
 
-def test_wildcard_with_credentials_is_high():
+def test_wildcard_with_credentials_is_med():
+    # Browsers reject "*" with credentials, so this is a dangerous
+    # misconfiguration rather than a directly exploitable HIGH.
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Credentials": "true",
     }
-    assert one(check_cors("example.com", headers)).severity == Severity.HIGH
+    assert one(check_cors("example.com", headers)).severity == Severity.MED
 
 
 def test_wildcard_alone_is_low():
@@ -59,7 +61,7 @@ def test_header_names_and_credentials_value_are_case_insensitive():
         "access-control-allow-origin": "*",
         "ACCESS-CONTROL-ALLOW-CREDENTIALS": "True",
     }
-    assert one(check_cors("example.com", headers)).severity == Severity.HIGH
+    assert one(check_cors("example.com", headers)).severity == Severity.MED
 
 
 def test_custom_origin_is_what_counts_as_reflected():

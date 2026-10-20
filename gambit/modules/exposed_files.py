@@ -7,7 +7,7 @@ from typing import Callable, Optional
 
 import requests
 
-from gambit.http import TIMEOUT, USER_AGENT, get
+from gambit.http import TIMEOUT, USER_AGENT, get_for_host
 from gambit.models import Finding, Severity
 
 # Re-exported for backwards compatibility; canonical values live in gambit.http.
@@ -142,11 +142,13 @@ def evaluate(
 def run(target: str) -> list[Finding]:
     """Request each path once and report the ones that look exposed."""
     findings = []
-    for check in CHECKS:
-        url = f"https://{target}{check.path}"
+    for index, check in enumerate(CHECKS):
+        if index:
+            time.sleep(DELAY)  # between requests only, never after the last
         try:
-            with get(
-                url,
+            with get_for_host(
+                target,
+                check.path,
                 timeout=TIMEOUT,
                 allow_redirects=False,
                 stream=True,
@@ -161,5 +163,4 @@ def run(target: str) -> list[Finding]:
         finding = evaluate(target, check, status, body)
         if finding:
             findings.append(finding)
-        time.sleep(DELAY)
     return findings

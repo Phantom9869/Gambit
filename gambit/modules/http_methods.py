@@ -12,7 +12,7 @@ from collections.abc import Mapping
 
 import requests
 
-from gambit.http import TIMEOUT, USER_AGENT
+from gambit.http import TIMEOUT, USER_AGENT, options_for_host
 from gambit.models import Finding, Severity
 
 # Re-exported for consistency; canonical values live in gambit.http.
@@ -134,11 +134,9 @@ evaluate = check_methods
 
 def run(target: str) -> list[Finding]:
     """Send one OPTIONS request and flag dangerous methods in ``Allow``."""
-    url = f"https://{target}"
     try:
-        response = requests.options(
-            url,
-            headers={"User-Agent": USER_AGENT},
+        response = options_for_host(
+            target,
             timeout=TIMEOUT,
             allow_redirects=True,
         )
@@ -147,10 +145,10 @@ def run(target: str) -> list[Finding]:
             Finding(
                 severity=Severity.INFO,
                 host=target,
-                title="Could not fetch site over HTTPS",
+                title="Could not fetch site",
                 evidence=str(exc),
                 why="The HTTP methods check could not run.",
-                next_step="Check the hostname, and whether the site only serves HTTP.",
+                next_step="Check the hostname and whether the site is reachable.",
             )
         ]
     return check_methods(target, response.headers)

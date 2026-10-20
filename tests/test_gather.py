@@ -1,4 +1,5 @@
 from gambit.models import Severity
+from gambit.modules import gather
 from gambit.modules.gather import evaluate_dns, parse_crtsh
 
 
@@ -109,3 +110,33 @@ def test_evaluate_dns_ignores_empty_values():
     findings = evaluate_dns("example.com", {"A": [], "TXT": ["", "  "]})
     assert "DNS A record(s) found" not in titles(findings)
     assert "No DNS records found" in titles(findings)
+
+
+# --- crt.sh is queried once per host per process -------------------------
+
+
+def test_crtsh_fetch_is_cached_between_run_and_discovery(monkeypatch):
+    gather.clear_crtsh_cache()
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return [{"name_value": "www.example.com\nexample.com"}]
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return FakeResponse()
+
+    monkeypatch.setattr(gather, "get", fake_get)
+    monkeypatch.setattr(gather, "lookup_dns", lambda host: {})
+
+    try:
+        assert gather.discover_subdomains("example.com") == ["www.example.com"]
+        findings = gather.run("example.com")
+        assert "Subdomains discovered via crt.sh" in titles(findings)
+        assert len(calls) == 1  # second call served from cache
+    finally:
+        gather.clear_crtsh_cache()

@@ -10,7 +10,7 @@ from collections.abc import Mapping
 
 import requests
 
-from gambit.http import TIMEOUT, USER_AGENT, get
+from gambit.http import TIMEOUT, USER_AGENT, get_for_host
 from gambit.models import Finding, Severity
 
 # Re-exported for backwards compatibility; canonical values live in gambit.http.
@@ -59,12 +59,16 @@ def check_cors(host, headers=None, origin: str = TEST_ORIGIN) -> list[Finding]:
             "Access-Control-Allow-Origin to trusted origins."
         )
     elif wildcard and credentials:
-        severity = Severity.HIGH
-        title = "CORS allows any origin with credentials"
+        # Browsers reject "*" together with credentials, so this alone
+        # is not exploitable -- but it is a misconfiguration that turns
+        # dangerous the moment the server starts reflecting origins.
+        severity = Severity.MED
+        title = "CORS wildcard origin combined with credentials"
         why = (
             "A wildcard origin combined with credentialed requests is an "
-            "unsafe policy that may expose authenticated responses; some "
-            "servers reflect origins to make this combination work."
+            "unsafe policy: browsers currently block reading such "
+            "responses, but the configuration is one reflection change "
+            "away from exposing authenticated data."
         )
         next_step = (
             "Confirm the effective policy from a foreign origin, then "
@@ -118,10 +122,9 @@ evaluate = check_cors
 
 def run(target: str) -> list[Finding]:
     """Fetch the target once with a test Origin and grade its CORS headers."""
-    url = f"https://{target}"
     try:
-        response = get(
-            url,
+        response = get_for_host(
+            target,
             timeout=TIMEOUT,
             allow_redirects=True,
             headers={"Origin": TEST_ORIGIN},
@@ -131,10 +134,10 @@ def run(target: str) -> list[Finding]:
             Finding(
                 severity=Severity.INFO,
                 host=target,
-                title="Could not fetch site over HTTPS",
+                title="Could not fetch site",
                 evidence=str(exc),
                 why="The CORS check could not run.",
-                next_step="Check the hostname, and whether the site only serves HTTP.",
+                next_step="Check the hostname and whether the site is reachable.",
             )
         ]
     return check_cors(target, response.headers)

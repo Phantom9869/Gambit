@@ -56,6 +56,52 @@ def normalize_host(host: str) -> str:
     return value.strip()
 
 
+def split_host_port(host: str) -> tuple[str, int | None]:
+    """Split a target into (hostname, port-or-None). No network access.
+
+    Accepts anything :func:`normalize_host` accepts (scheme, path,
+    userinfo, trailing dot are stripped first). Socket-level code should
+    use the hostname from here, never the raw target: a raw
+    ``"example.com:8080"`` is not a resolvable name.
+    """
+    normalized = normalize_host(host)
+    name, sep, port = normalized.rpartition(":")
+    if sep and name and port.isdigit():
+        return name, int(port)
+    return normalized, None
+
+
+def host_reachable(host: str, *, timeout: float = 1.0) -> bool:
+    """Cheap liveness pre-flight: does the host answer on any web port?
+
+    Tries the target's explicit port if it has one, else the common web
+    ports (443, 8443, 80, 8080, 8000, 3000) with a short timeout. This
+    exists so a filtered/dead host costs a few seconds instead of every
+    web module's full timeout stacked together. Also primes the HTTP
+    scheme cache: if only a plain-HTTP port answers, later web modules
+    go straight to HTTP. Only gates web-fetch modules -- takeover and
+    port checks must run even for hosts that answer on no web port.
+    """
+    import socket
+
+    from gambit.http import set_preferred_scheme
+
+    name, explicit_port = split_host_port(host)
+    if not name:
+        return False
+    ports = [explicit_port] if explicit_port else [443, 8443, 80, 8080, 8000, 3000]
+    for port in ports:
+        try:
+            with socket.create_connection((name, port), timeout=timeout):
+                pass
+        except OSError:
+            continue
+        if explicit_port is None:
+            set_preferred_scheme(host, "https" if port in (443, 8443) else "http")
+        return True
+    return False
+
+
 def dedupe_hosts(
     hosts: Iterable[str] | None, max_hosts: Optional[int] = DEFAULT_MAX_HOSTS
 ) -> list[str]:
@@ -112,6 +158,13 @@ def _module_name(module) -> str:
     return getattr(module, "__name__", None) or type(module).__name__
 
 
+_CONNECTIVITY_PREFIXES = ("Could not fetch", "Could not check TLS")
+
+
+def _is_connectivity(finding: Finding) -> bool:
+    return finding.title.startswith(_CONNECTIVITY_PREFIXES)
+
+
 def run_for_host(host: str, modules: Iterable[ModuleLike] | None) -> list[Finding]:
     """Run every module against one host, isolating per-module failures.
 
@@ -119,8 +172,14 @@ def run_for_host(host: str, modules: Iterable[ModuleLike] | None) -> list[Findin
     ``"Module <name> failed"`` (evidence is the exception message); the
     remaining modules for this host still run. Modules returning ``None``
     are treated as returning no findings.
+
+    Connectivity failures ("Could not fetch...", "Could not check
+    TLS...") are reported at most once per host: when several modules
+    cannot reach the host at all, one INFO finding says so instead of
+    four near-duplicates.
     """
     findings: list[Finding] = []
+    connectivity_reported = False
     for module in modules or []:
         try:
             result = module.run(host)
@@ -136,8 +195,12 @@ def run_for_host(host: str, modules: Iterable[ModuleLike] | None) -> list[Findin
                 )
             )
             continue
-        if result:
-            findings.extend(result)
+        for finding in result or []:
+            if _is_connectivity(finding):
+                if connectivity_reported:
+                    continue
+                connectivity_reported = True
+            findings.append(finding)
     return findings
 
 
@@ -155,6 +218,7 @@ def run_pipeline(
     max_hosts: Optional[int] = DEFAULT_MAX_HOSTS,
     delay: float | None = DEFAULT_DELAY,
     sleep: Callable[[float], None] = time.sleep,
+    preflight: Callable[[str], bool] | None = None,
 ) -> list[Finding]:
     """Run ``modules`` against every host for ``target``; return all findings.
 
@@ -165,6 +229,12 @@ def run_pipeline(
     ``max_hosts`` (default 25). ``sleep(delay)`` is called *between*
     hosts (never before the first) when ``delay`` is positive; pass
     ``delay=0`` or inject ``sleep`` to disable waiting in tests.
+
+    If ``preflight`` is given, it is called once per host first; a host
+    it rejects gets a single INFO "Host did not respond" finding and its
+    modules are skipped, so one dead host cannot stack every module's
+    full timeout. (:func:`host_reachable` is the production preflight.)
+
     Findings are returned in host-then-module order; ranking for display
     stays Triage's job (``gambit.triage.rank``).
     """
@@ -179,6 +249,21 @@ def run_pipeline(
     for index, host in enumerate(resolved):
         if index and delay:
             sleep(delay)
+        if preflight is not None and not preflight(host):
+            findings.append(
+                Finding(
+                    severity=Severity.INFO,
+                    host=host,
+                    title="Host did not respond to a connection attempt",
+                    evidence="TCP connection to the host failed or timed out "
+                    "on the checked ports (pre-flight)",
+                    why="The host may be offline, filtered, or no longer "
+                    "in service, so the per-host checks were skipped.",
+                    next_step="Confirm the host is still in use; if it is "
+                    "a stale subdomain, consider removing its DNS records.",
+                )
+            )
+            continue
         findings.extend(run_for_host(host, modules))
     return findings
 
@@ -188,10 +273,12 @@ __all__ = [
     "DEFAULT_DELAY",
     "DELAY",
     "ModuleLike",
-    "normalize_host",
     "dedupe_hosts",
     "discover_hosts",
+    "host_reachable",
+    "normalize_host",
     "run_for_host",
     "run_modules_for_host",
     "run_pipeline",
+    "split_host_port",
 ]

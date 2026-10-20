@@ -2,7 +2,7 @@
 
 import requests
 
-from gambit.http import TIMEOUT, USER_AGENT, get
+from gambit.http import TIMEOUT, USER_AGENT, get_for_host
 from gambit.models import Finding, Severity
 
 # Re-exported for backwards compatibility; canonical values live in gambit.http.
@@ -67,11 +67,10 @@ def check_headers(host: str, headers: dict) -> list[Finding]:
 
 
 def run(target: str) -> list[Finding]:
-    """Fetch the target over HTTPS and check its security headers."""
-    url = f"https://{target}"
+    """Fetch the target (HTTPS, falling back to HTTP) and check headers."""
     try:
-        response = get(
-            url,
+        response = get_for_host(
+            target,
             timeout=TIMEOUT,
             allow_redirects=True,
         )
@@ -80,10 +79,10 @@ def run(target: str) -> list[Finding]:
             Finding(
                 severity=Severity.INFO,
                 host=target,
-                title="Could not fetch site over HTTPS",
+                title="Could not fetch site",
                 evidence=str(exc),
                 why="The headers check could not run.",
-                next_step="Check the hostname, and whether the site only serves HTTP.",
+                next_step="Check the hostname and whether the site is reachable.",
             )
         ]
     return check_headers(target, response.headers)

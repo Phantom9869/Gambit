@@ -153,3 +153,60 @@ def test_run_pipeline_failure_on_one_host_does_not_stop_others():
     assert len(findings) == 2
     assert findings[0].severity == Severity.INFO and "failed" in findings[0].title
     assert findings[1].host == "a.example.com"
+
+
+# --- split_host_port / preflight / connectivity dedupe --------------------
+
+
+def test_split_host_port():
+    from gambit.pipeline import split_host_port
+
+    assert split_host_port("example.com") == ("example.com", None)
+    assert split_host_port("https://example.com:8443/path") == ("example.com", 8443)
+    assert split_host_port("example.com:notaport") == ("example.com:notaport", None)
+
+
+def test_run_pipeline_preflight_skips_dead_hosts():
+    findings = run_pipeline(
+        "example.com",
+        [GoodModule()],
+        hosts=["dead.example.com"],
+        delay=0,
+        sleep=lambda s: None,
+        preflight=lambda host: host != "dead.example.com",
+    )
+    assert [f.host for f in findings] == ["example.com", "dead.example.com"]
+    assert findings[0].title == "good:example.com"
+    assert "did not respond" in findings[1].title
+
+
+def test_run_for_host_reports_connectivity_failure_only_once():
+    class FetchFailModule:
+        def run(self, target):
+            return [
+                Finding(
+                    Severity.INFO,
+                    target,
+                    "Could not fetch site",
+                    "boom",
+                    "w",
+                    "n",
+                )
+            ]
+
+    class TlsFailModule:
+        def run(self, target):
+            return [
+                Finding(
+                    Severity.INFO,
+                    target,
+                    "Could not check TLS",
+                    "boom",
+                    "w",
+                    "n",
+                )
+            ]
+
+    findings = run_for_host("example.com", [FetchFailModule(), TlsFailModule()])
+    assert len(findings) == 1
+    assert findings[0].title == "Could not fetch site"

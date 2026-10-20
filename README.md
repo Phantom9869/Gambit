@@ -50,7 +50,7 @@ gambit example.com
 python -m gambit example.com
 ```
 
-GAMBIT first runs Gather for the target, then runs the per-host checks (Analyze, Baseline, Inspect, and Map) on the apex host and the subdomains it discovers, and finally ranks everything with Triage. Discovered hosts are de-duplicated and capped (25 by default; see `--max-hosts`) so a scan stays small, and hosts are checked one at a time with a short pause between them.
+GAMBIT first runs Gather for the target, then runs the per-host checks (takeover, Analyze, Baseline, Inspect, and Map) on the apex host and the subdomains it discovers, and finally ranks everything with Triage. Discovered hosts are de-duplicated and capped (25 by default; see `--max-hosts`) so a scan stays small. Each host first gets a cheap connection pre-flight, so a dead subdomain costs a second instead of stacking every check's timeout; hosts are then checked one at a time with a short pause between them. Web checks try HTTPS first and fall back to plain HTTP, so HTTP-only sites are still checked.
 
 | Flag | Description |
 |---|---|
@@ -71,20 +71,25 @@ gambit example.com --yes --format md --max-hosts 10 -o report.md
 ```
 $ gambit example.com
 
-[HIGH]  dev.example.com: /.git/HEAD is publicly accessible
-        Why:  Source code and history may be recoverable.
-        Next: Confirm manually; check for credentials in commit history.
+[HIGH] dev.example.com: Git repository exposed (/.git/HEAD)
+        Evidence: GET /.git/HEAD returned HTTP 200 with a matching signature
+        Why:      The .git directory is publicly readable, so source code and history may be recoverable.
+        Next:     Confirm manually and check commit history for credentials. Report it; do not mirror the repo.
 
-[HIGH]  old.example.com: CNAME points to an unclaimed GitHub Pages site
-        Why:  Subdomain takeover is likely possible.
-        Next: Verify the fingerprint, then report it. Do not claim the resource.
+[HIGH] old.example.com: Possible subdomain takeover (GitHub Pages)
+        Evidence: CNAME old.example.com -> old.github.io (GitHub Pages); the CNAME destination does not resolve
+        Why:      A dangling CNAME to a third-party service can let someone else register the abandoned resource and serve content as this host.
+        Next:     Confirm who owns this host and its service resource. Report it; do not claim a resource that is not yours.
 
-[MED]   api.example.com: CORS reflects arbitrary Origin headers
-        Why:  Cross-origin pages may be able to read authenticated responses.
-        Next: Test whether credentials are allowed alongside the wildcard origin.
+[MED] api.example.com: CORS reflects arbitrary Origin headers
+        Evidence: Access-Control-Allow-Origin: https://gambit-check.example (test Origin: https://gambit-check.example)
+        Why:      Reflecting any Origin lets other websites read responses cross-origin; the impact grows if credentials are ever allowed.
+        Next:     Test whether credentials are allowed alongside the reflected origin, then restrict reflection to trusted origins.
 
-[INFO]  www.example.com: nginx 1.x with PHP (via X-Powered-By)
-        Next: Look at PHP-specific issues and the version for known CVEs.
+[LOW] www.example.com: Version disclosed in Server header (1.24.0)
+        Evidence: Server: nginx/1.24.0
+        Why:      An exact version lets an attacker match the target against known CVEs instead of probing blindly.
+        Next:     Check the disclosed version for known CVEs; consider suppressing version details in the server configuration.
 ```
 
 Reports can be exported as Markdown (for humans) or JSON (for pipelines).
@@ -140,7 +145,7 @@ Adding a check means adding one file. The Triage stage sorts every finding from 
 - [x] **Inspect:** exposed-file checks
 - [x] **Map:** common-port check
 - [x] **Triage:** severity ranking and Markdown/JSON export
-- [ ] Tests for every module
+- [x] Tests for every module
 - [x] CI (pytest on Ubuntu and Windows, Python 3.11 and 3.12)
 - [ ] First tagged release
 

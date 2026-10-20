@@ -290,21 +290,23 @@ evaluate_tls = evaluate
 
 
 def _split_host_port(target: str) -> tuple[str, int]:
-    value = str(target).strip()
-    if "://" in value:
-        value = value.split("://", 1)[1]
-    value = value.split("/", 1)[0]
-    if ":" in value:
-        hostname, _, port = value.rpartition(":")
-        if hostname and port.isdigit():
-            return hostname, int(port)
-    return value, 443
+    from gambit.pipeline import split_host_port
+
+    name, port = split_host_port(target)
+    return name, port if port is not None else 443
 
 
 def _handshake(hostname: str, port: int, context: ssl.SSLContext):
     with socket.create_connection((hostname, port), timeout=TIMEOUT) as sock:
         with context.wrap_socket(sock, server_hostname=hostname) as tls_sock:
             return tls_sock.getpeercert(), tls_sock.version()
+
+
+def _unverified_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
 
 
 def run(target: str) -> list[Finding]:
@@ -319,7 +321,7 @@ def run(target: str) -> list[Finding]:
         # Still collect cert details without verification for expiry/version.
         try:
             cert, protocol = _handshake(
-                hostname, port, ssl._create_unverified_context()
+                hostname, port, _unverified_context()
             )
         except Exception:
             return [

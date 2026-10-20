@@ -27,6 +27,7 @@ __all__ = [
     "RECORD_TYPES",
     "TIMEOUT",
     "USER_AGENT",
+    "clear_crtsh_cache",
     "discover_subdomains",
     "evaluate_dns",
     "lookup_dns",
@@ -215,10 +216,35 @@ def lookup_dns(host: str) -> dict[str, list[str]]:
 
 
 def _fetch_crtsh_subdomains(host: str) -> list[str]:
-    """GET crt.sh for ``host`` and parse the response. Raises on failure."""
-    response = get(_CRT_SH_URL.format(host=host), timeout=TIMEOUT)
-    response.raise_for_status()
-    return parse_crtsh(response.json())
+    """GET crt.sh for ``host`` and parse the response. Raises on failure.
+
+    Results (and failures) are cached per host for the life of the
+    process: a scan calls this from both ``run`` (to report) and
+    ``discover_subdomains`` (to build the host list), and crt.sh should
+    only be queried once per host per scan.
+    """
+    if host in _CRTSH_CACHE:
+        cached = _CRTSH_CACHE[host]
+        if isinstance(cached, Exception):
+            raise cached
+        return cached
+    try:
+        response = get(_CRT_SH_URL.format(host=host), timeout=TIMEOUT)
+        response.raise_for_status()
+        names = parse_crtsh(response.json())
+    except Exception as exc:
+        _CRTSH_CACHE[host] = exc
+        raise
+    _CRTSH_CACHE[host] = names
+    return names
+
+
+_CRTSH_CACHE: dict[str, list[str] | Exception] = {}
+
+
+def clear_crtsh_cache() -> None:
+    """Forget cached crt.sh results (mainly for tests)."""
+    _CRTSH_CACHE.clear()
 
 
 def _own_subdomains(host: str, names: Iterable[str]) -> list[str]:

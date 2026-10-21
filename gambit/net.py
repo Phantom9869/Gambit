@@ -2,15 +2,19 @@
 
 ``socket.create_connection`` resolves names with ``getaddrinfo`` before it
 starts the connect timer, so a stuck resolver can hang a scan forever.
-Callers here resolve with dnspython's ``lifetime`` first, then connect to
-the resulting address.
+:func:`resolve_ips` asks the system resolver (so ``/etc/hosts``, mDNS, and
+NSS apply) inside a daemon thread and stops waiting at ``timeout``. One
+lookup covers both address families; the deadline is not spent twice.
+
+A lookup that outruns the deadline is abandoned. The thread keeps running
+until the libc call returns — Python cannot cancel ``getaddrinfo`` — but
+the scan does not wait for it, and the thread is a daemon so it will not
+hold the process open.
 """
 
 import ipaddress
 import socket
-
-import dns.exception
-import dns.resolver
+import threading
 
 
 def is_ip_address(hostname: str) -> bool:
@@ -39,39 +43,80 @@ def is_public_ip(ip: str) -> bool:
 def resolve_ips(hostname: str, timeout: float) -> list[str]:
     """Resolve ``hostname`` to IP strings within ``timeout`` seconds.
 
-    An address literal is returned as itself, with no DNS query. DNS
-    failures and an empty answer both yield ``[]``; they never raise.
+    An address literal is returned as itself, with no name lookup. The
+    system resolver (``getaddrinfo``) is used for every other name, so
+    hosts-file and NSS answers are visible. Failures, an empty answer,
+    and a lookup that exceeds ``timeout`` all yield ``[]``; they never
+    raise. The whole lookup shares one deadline.
     """
     if is_ip_address(hostname):
         return [hostname]
+    if not hostname or not str(hostname).strip():
+        return []
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError):
+        return []
+    if budget <= 0:
+        return []
+
+    box: dict = {}
+
+    def worker() -> None:
+        try:
+            box["ips"] = _resolve_system(hostname)
+        except Exception as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=worker, name="gambit-resolve", daemon=True)
+    thread.start()
+    thread.join(budget)
+    if thread.is_alive() or "ips" not in box:
+        return []
+    return list(box["ips"])
+
+
+def _resolve_system(hostname: str) -> list[str]:
+    """One ``getaddrinfo`` call: hosts file, then DNS, A and AAAA together."""
+    try:
+        infos = socket.getaddrinfo(
+            hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+    except OSError:
+        return []
     found: list[str] = []
     seen: set[str] = set()
-    for rdtype in ("A", "AAAA"):
-        try:
-            answers = dns.resolver.resolve(hostname, rdtype, lifetime=timeout)
-        except dns.exception.DNSException:
+    for _family, socktype, _proto, _canon, sockaddr in infos:
+        if socktype != socket.SOCK_STREAM:
             continue
-        for rdata in answers:
-            ip = getattr(rdata, "address", None) or str(rdata).strip()
-            if ip and ip not in seen:
-                seen.add(ip)
-                found.append(ip)
+        ip = sockaddr[0]
+        if ip and ip not in seen:
+            seen.add(ip)
+            found.append(ip)
     return found
 
 
-def connect(hostname: str, port: int, timeout: float):
+def connect(
+    hostname: str,
+    port: int,
+    timeout: float,
+    *,
+    resolved: list[str] | None = None,
+):
     """TCP-connect to ``hostname``:``port`` with DNS bounded by ``timeout``.
 
     The socket is connected to a resolved address, never to a name, so
-    ``getaddrinfo`` is only asked to parse an IP literal. Ports outside
+    the second ``getaddrinfo`` only parses an IP literal. Ports outside
     1–65535 raise ``OSError`` instead of being truncated by the resolver.
-    Raises ``OSError`` when the name does not resolve or every address
-    refuses the connection.
+    Pass ``resolved`` to dial addresses already looked up (one lookup
+    for many ports). ``None`` resolves ``hostname``; an empty list does
+    not, and raises. Raises ``OSError`` when the name does not resolve
+    or every address refuses the connection.
     """
     number = int(port)
     if number < 1 or number > 65535:
         raise OSError(f"port out of range: {port}")
-    ips = resolve_ips(hostname, timeout)
+    ips = list(resolved) if resolved is not None else resolve_ips(hostname, timeout)
     if not ips:
         raise OSError(f"could not resolve {hostname}")
     last: OSError | None = None

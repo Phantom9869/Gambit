@@ -166,6 +166,89 @@ def test_split_host_port():
     assert split_host_port("example.com:notaport") == ("example.com:notaport", None)
 
 
+def test_split_host_port_ipv6_and_out_of_range_ports():
+    from gambit.pipeline import normalize_host, port_out_of_range, split_host_port
+
+    assert normalize_host("2001:db8::1") == "[2001:db8::1]"
+    assert normalize_host("[::1]") == "[::1]"
+    assert normalize_host("HTTPS://[2001:db8::1]:8443/path") == "[2001:db8::1]:8443"
+    assert dedupe_hosts(["::1", "[::1]"]) == ["[::1]"]
+
+    assert split_host_port("[::1]") == ("::1", None)
+    assert split_host_port("2001:db8::1") == ("2001:db8::1", None)
+    assert split_host_port("[2001:db8::1]:8443") == ("2001:db8::1", 8443)
+    assert split_host_port("https://[2001:db8::1]:8443/x") == ("2001:db8::1", 8443)
+
+    # 99999 must not survive as a port: getaddrinfo would wrap it to 34463.
+    assert port_out_of_range("example.com:99999")
+    assert split_host_port("example.com:99999") == ("example.com", None)
+    assert split_host_port("example.com:65536") == ("example.com", None)
+    assert split_host_port("example.com:0") == ("example.com", None)
+    assert split_host_port("example.com:65535") == ("example.com", 65535)
+    assert split_host_port("[2001:db8::1]:99999") == ("2001:db8::1", None)
+
+
+def test_out_of_range_port_does_not_connect(monkeypatch):
+    from gambit.pipeline import host_reachable
+
+    called = []
+
+    def fake_connect(*args, **kwargs):
+        called.append(args)
+        raise OSError("should not be called")
+
+    monkeypatch.setattr("gambit.net.connect", fake_connect)
+    assert host_reachable("example.com:99999", timeout=0.1) is False
+    assert called == []
+
+
+def test_preflight_open_alt_port_is_used_in_the_url(monkeypatch):
+    import gambit.http as http
+    from gambit.pipeline import host_reachable
+
+    http.clear_scheme_cache()
+
+    def fake_connect(hostname, port, timeout):
+        if port not in (8443, 8080):
+            raise OSError("closed")
+
+        class Sock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        # 8443 is tried before 8080, so this host looks HTTPS-on-8443.
+        if port == 8443 and hostname == "alt.example":
+            return Sock()
+        if port == 8080 and hostname == "dev.example":
+            return Sock()
+        raise OSError("closed")
+
+    monkeypatch.setattr("gambit.net.connect", fake_connect)
+    assert host_reachable("alt.example", timeout=0.2) is True
+    assert host_reachable("dev.example", timeout=0.2) is True
+
+    seen = []
+
+    def fake_request(method, url, **kwargs):
+        seen.append(url)
+
+        class Response:
+            def __init__(self, url):
+                self.url = url
+
+        return Response(url)
+
+    monkeypatch.setattr(http, "request", fake_request)
+    http.get_for_host("alt.example")
+    http.get_for_host("dev.example")
+    assert seen[0] == "https://alt.example:8443"
+    assert seen[1] == "http://dev.example:8080"
+    http.clear_scheme_cache()
+
+
 def test_run_pipeline_preflight_skips_dead_hosts():
     findings = run_pipeline(
         "example.com",

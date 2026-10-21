@@ -5,6 +5,7 @@ from gambit.modules.ports import (
     PORTS,
     WEB_PORTS,
     evaluate,
+    run,
     service_for_port,
     severity_for_port,
 )
@@ -42,6 +43,22 @@ def test_service_for_port():
     assert service_for_port(443) == "HTTPS"
     assert service_for_port(5432) == "PostgreSQL"
     assert service_for_port(12345) == "unknown"
+
+
+def test_explicit_port_is_probed_and_out_of_range_port_is_not(monkeypatch):
+    tried = []
+
+    def fake_connect(hostname, port, timeout):
+        tried.append((hostname, port))
+        raise OSError("closed")
+
+    monkeypatch.setattr("gambit.net.connect", fake_connect)
+    assert run("example.com:9090") == []
+    assert ("example.com", 9090) in tried
+    tried.clear()
+    assert run("example.com:99999") == []
+    assert all(port != 99999 and port != 34463 for _host, port in tried)
+    assert ("example.com", 443) in tried
 
 
 def test_evaluate_builds_finding_for_open_port():

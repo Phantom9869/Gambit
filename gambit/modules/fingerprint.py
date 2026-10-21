@@ -11,7 +11,7 @@ from collections.abc import Mapping
 
 import requests
 
-from gambit.http import TIMEOUT, USER_AGENT, get_for_host
+from gambit.http import TIMEOUT, USER_AGENT, annotate_findings, get_for_host
 from gambit.models import Finding, Severity
 
 # Re-exported for backwards compatibility; canonical values live in gambit.http.
@@ -265,4 +265,4 @@ def run(target: str) -> list[Finding]:
     except Exception:
         body = ""
     cookie_names = _cookie_names(getattr(response, "cookies", None))
-    return identify(target, response.headers, cookie_names, body)
+    return annotate_findings(identify(target, response.headers, cookie_names, body), response)

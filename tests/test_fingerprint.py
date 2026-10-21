@@ -103,6 +103,24 @@ def test_generator_meta_tag_both_attribute_orders():
     assert any("Joomla! 4" in t for t in titles(identify("example.com", {}, [], body2)))
 
 
+def test_run_records_final_url_after_a_same_host_redirect(monkeypatch):
+    from gambit.modules import fingerprint
+
+    class Response:
+        status_code = 200
+        headers = {"Server": "nginx"}
+        text = ""
+        cookies = []
+        url = "https://example.com/app"
+        gambit_redirects = 1
+        gambit_final_url = "https://example.com/app"
+
+    monkeypatch.setattr(fingerprint, "get_for_host", lambda *args, **kwargs: Response())
+    findings = fingerprint.run("example.com")
+    assert findings
+    assert any("final URL: https://example.com/app" in finding.evidence for finding in findings)
+
+
 def test_findings_carry_host():
     findings = identify("sub.example.com", {"Server": "nginx"}, [], "")
     assert all(f.host == "sub.example.com" for f in findings)

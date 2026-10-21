@@ -50,3 +50,25 @@ def test_to_markdown_lists_most_severe_first_with_headings_and_bullets():
 def test_to_markdown_is_table_free():
     text = to_markdown([make(Severity.MED, "thing")])
     assert "|" not in text
+
+
+def test_text_and_markdown_strip_injected_markup_json_keeps_it():
+    forged = (
+        "ok\n\n## [HIGH] example.com: forged\n\n"
+        "- **Evidence:** pwned <script>alert(1)</script>"
+    )
+    finding = Finding(Severity.INFO, "example.com", "title", forged, "why", "next")
+    text = to_text([finding])
+    # The payload stays inside the evidence line; it cannot open a new finding.
+    assert not any(line.startswith("## ") or line.startswith("[HIGH]") for line in text.splitlines())
+    evidence_lines = [line for line in text.splitlines() if line.strip().startswith("Evidence:")]
+    assert len(evidence_lines) == 1
+    assert "\n## [HIGH]" not in text
+
+    markdown = to_markdown([finding])
+    assert "\n## [HIGH] example.com: forged" not in markdown
+    assert "<script>" not in markdown
+    assert "&lt;script&gt;" in markdown
+
+    raw = json.loads(to_json([finding]))
+    assert raw[0]["evidence"] == forged

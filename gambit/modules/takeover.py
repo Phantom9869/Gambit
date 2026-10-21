@@ -30,7 +30,7 @@ import requests
 
 from gambit.http import TIMEOUT, USER_AGENT, get_for_host
 from gambit.models import Finding, Severity
-from gambit.pipeline import normalize_host
+from gambit.pipeline import normalize_host, split_host_port
 
 __all__ = [
     "FINGERPRINT_PATH",
@@ -56,11 +56,18 @@ _MAX_BODY = 64_000  # chars of a response worth searching for fingerprints
 
 @dataclass(frozen=True)
 class Fingerprint:
-    """One third-party service a dangling CNAME can point at."""
+    """One third-party service a dangling CNAME can point at.
+
+    ``claimable`` means a name that simply fails to resolve is enough to
+    call the case a possible takeover (GitHub Pages, S3, Heroku, …).
+    Services that are not claimable that way stay INFO unless a specific
+    unclaimed-page fingerprint is served with an HTTP error status.
+    """
 
     service: str
     cname_suffixes: tuple[str, ...]
     fingerprints: tuple[str, ...]
+    claimable: bool = True
 
 
 def _as_str_tuple(raw) -> tuple[str, ...]:
@@ -115,6 +122,11 @@ def load_fingerprints(path=None) -> list[Fingerprint]:
         )
         if not service or not str(service).strip() or not suffixes:
             continue
+        raw_claimable = entry.get("claimable", True)
+        if isinstance(raw_claimable, str):
+            claimable = raw_claimable.strip().lower() in ("1", "true", "yes")
+        else:
+            claimable = bool(raw_claimable)
         fingerprints.append(
             Fingerprint(
                 service=str(service).strip(),
@@ -124,6 +136,7 @@ def load_fingerprints(path=None) -> list[Fingerprint]:
                     or entry.get("unclaimed_fingerprints")
                     or entry.get("fingerprint")
                 ),
+                claimable=claimable,
             )
         )
     return fingerprints
@@ -178,12 +191,13 @@ def evaluate(
 
     ``resolves`` says whether the CNAME destination resolves
     (``True``/``False``; ``None`` = unknown), ``body`` is the host's
-    HTTP response body if one was fetched (``status_code`` is accepted
-    for evidence context and does not change the verdict). Returns
-    ``None`` when there is no CNAME or it points at an unknown service.
-    HIGH requires a known service *plus* an unresolvable destination
-    or a served unclaimed fingerprint; anything else for a known
-    service is INFO.
+    HTTP response body if one was fetched. ``status_code``, when
+    provided, gates the fingerprint: a 2xx or 3xx response does not
+    count as an unclaimed page. ``None`` leaves that check unchanged.
+    Returns ``None`` when there is no CNAME or it points at an unknown
+    service. HIGH requires a known service plus either a claimable
+    destination that does not resolve, or a served unclaimed
+    fingerprint. Anything else for a known service is INFO.
     """
     destination = normalize_host(cname or "")
     if not destination:
@@ -192,11 +206,19 @@ def evaluate(
     if fingerprint is None:
         return None
 
-    matched = find_unclaimed_fingerprint(body, fingerprint)
+    # A 2xx/3xx page that happens to quote a fingerprint string is not an
+    # unclaimed service. Unknown status (callers that only have a body)
+    # still counts, so a fingerprint match is not silently dropped.
+    status_supports_fingerprint = status_code is None or status_code >= 400
+    matched = (
+        find_unclaimed_fingerprint(body, fingerprint)
+        if status_supports_fingerprint
+        else None
+    )
     reasons = []
     if matched is not None:
         reasons.append(f"response serves the unclaimed fingerprint {matched!r}")
-    if resolves is False:
+    if resolves is False and fingerprint.claimable:
         reasons.append("the CNAME destination does not resolve")
 
     if reasons:
@@ -216,14 +238,20 @@ def evaluate(
             "yours and abandoned, remove the CNAME or reclaim the resource. Report "
             "it to the owner; do not claim a resource that is not yours.",
         )
+    if resolves is True:
+        observed = "destination resolves and no unclaimed fingerprint was observed"
+    elif resolves is False:
+        observed = (
+            "destination does not resolve, but this service is not treated "
+            "as claimable from DNS alone"
+        )
+    else:
+        observed = "no unclaimed fingerprint was observed"
     return Finding(
         severity=Severity.INFO,
         host=host,
         title=f"CNAME points to {fingerprint.service}",
-        evidence=f"CNAME {host} -> {destination}; destination resolves and no "
-        "unclaimed fingerprint was observed"
-        if resolves is True
-        else f"CNAME {host} -> {destination}; no unclaimed fingerprint was observed",
+        evidence=f"CNAME {host} -> {destination}; {observed}",
         why="Third-party CNAMEs become a takeover risk when the resource behind "
         "them is abandoned, so this dependency is worth tracking.",
         next_step="Confirm the service resource behind this host is still owned "
@@ -233,7 +261,7 @@ def evaluate(
 
 def lookup_cname(host: str) -> Optional[str]:
     """Return the host's first CNAME destination (no trailing dot), or None."""
-    name = normalize_host(host)
+    name, _port = split_host_port(host)
     if not name:
         return None
     try:
@@ -280,11 +308,18 @@ def run(target: str) -> list[Finding]:
     resolves = _resolves(cname)
     body = None
     status_code = None
+    response = None
     if resolves is not False:
         try:
-            response = get_for_host(host, timeout=TIMEOUT, allow_redirects=True)
+            response = get_for_host(
+                host,
+                timeout=TIMEOUT,
+                allow_redirects=True,
+                max_bytes=_MAX_BODY,
+            )
         except requests.RequestException:
             body = None
+            response = None
         else:
             status_code = response.status_code
             body = (response.text or "")[:_MAX_BODY]
@@ -297,4 +332,8 @@ def run(target: str) -> list[Finding]:
         fingerprints=fingerprints,
         status_code=status_code,
     )
+    if finding and response is not None:
+        from gambit.http import annotate_findings
+
+        annotate_findings([finding], response)
     return [finding] if finding else []

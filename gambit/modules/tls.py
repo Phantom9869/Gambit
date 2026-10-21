@@ -9,8 +9,9 @@ evidence rather than a vulnerability claim, and its details are still
 collected over an unverified handshake for the expiry/version checks.
 """
 
-import socket
+import os
 import ssl
+import tempfile
 from collections.abc import Mapping
 from datetime import date, datetime, time, timezone
 
@@ -27,6 +28,7 @@ __all__ = [
     "evaluate_tls",
     "parse_cert_datetime",
     "days_until_expiry",
+    "certificate_from_socket",
     "run",
 ]
 
@@ -296,10 +298,76 @@ def _split_host_port(target: str) -> tuple[str, int]:
     return name, port if port is not None else 443
 
 
+def certificate_from_socket(tls_sock) -> dict:
+    """Peer certificate as a ``getpeercert()`` dict.
+
+    ``getpeercert()`` with no arguments returns ``{}`` when the handshake
+    did not validate the certificate, which is exactly the unverified
+    second connection this module uses to read an expired or self-signed
+    cert. The DER form is still available; decode that instead of
+    reporting that no certificate was presented.
+    """
+    try:
+        cert = tls_sock.getpeercert() or {}
+    except Exception:
+        cert = {}
+    if cert:
+        return cert
+    try:
+        der = tls_sock.getpeercert(binary_form=True)
+    except Exception:
+        return {}
+    if not der:
+        return {}
+    return _cert_dict_from_der(der)
+
+
+def _cert_dict_from_der(der: bytes) -> dict:
+    """Decode DER bytes into the dict shape ``getpeercert()`` uses.
+
+    The stdlib exposes that decoder only as ``ssl._ssl._test_decode_cert``,
+    which reads a PEM file. The file is created privately and removed
+    before this function returns; nothing is sent on the socket.
+    """
+    try:
+        pem = ssl.DER_cert_to_PEM_cert(der)
+    except Exception:
+        return {}
+    fd, path = tempfile.mkstemp(prefix="gambit-cert-", suffix=".pem")
+    try:
+        os.write(fd, pem.encode("ascii"))
+        os.close(fd)
+        fd = -1
+        decoded = ssl._ssl._test_decode_cert(path)
+    except Exception:
+        return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return decoded or {}
+
+
 def _handshake(hostname: str, port: int, context: ssl.SSLContext):
-    with socket.create_connection((hostname, port), timeout=TIMEOUT) as sock:
-        with context.wrap_socket(sock, server_hostname=hostname) as tls_sock:
-            return tls_sock.getpeercert(), tls_sock.version()
+    from gambit.net import connect
+
+    sock = connect(hostname, port, TIMEOUT)
+    try:
+        tls_sock = context.wrap_socket(sock, server_hostname=hostname)
+    except Exception:
+        closer = getattr(sock, "close", None)
+        if callable(closer):
+            closer()
+        raise
+    try:
+        return certificate_from_socket(tls_sock), tls_sock.version()
+    finally:
+        closer = getattr(tls_sock, "close", None)
+        if callable(closer):
+            closer()
 
 
 def _unverified_context() -> ssl.SSLContext:

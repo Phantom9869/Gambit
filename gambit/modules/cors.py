@@ -10,7 +10,7 @@ from collections.abc import Mapping
 
 import requests
 
-from gambit.http import TIMEOUT, USER_AGENT, get_for_host
+from gambit.http import TIMEOUT, USER_AGENT, annotate_findings, get_for_host
 from gambit.models import Finding, Severity
 
 # Re-exported for backwards compatibility; canonical values live in gambit.http.
@@ -140,4 +140,4 @@ def run(target: str) -> list[Finding]:
                 next_step="Check the hostname and whether the site is reachable.",
             )
         ]
-    return check_cors(target, response.headers)
+    return annotate_findings(check_cors(target, response.headers), response)

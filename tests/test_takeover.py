@@ -99,6 +99,59 @@ def test_evaluate_unknown_resolution_without_fingerprint_is_info():
     assert finding.severity == Severity.INFO
 
 
+def test_fingerprint_on_http_200_is_not_high_and_404_still_is():
+    page = "<html>There isn't a GitHub Pages site here.</html>"
+    live = evaluate(
+        "sub.example.com",
+        "foo.github.io",
+        resolves=True,
+        body=page,
+        status_code=200,
+        fingerprints=SERVICES,
+    )
+    assert live.severity == Severity.INFO
+    missing = evaluate(
+        "sub.example.com",
+        "foo.github.io",
+        resolves=True,
+        body=page,
+        status_code=404,
+        fingerprints=SERVICES,
+    )
+    assert missing.severity == Severity.HIGH
+
+
+def test_unclaimable_nxdomain_and_generic_iis_text_are_not_high():
+    from gambit.modules.takeover import load_fingerprints
+
+    bundled = load_fingerprints()
+    fastly = evaluate(
+        "a.example.com", "x.fastly.net", resolves=False, fingerprints=bundled
+    )
+    assert fastly.severity == Severity.INFO
+    github = evaluate(
+        "a.example.com", "x.github.io", resolves=False, fingerprints=bundled
+    )
+    assert github.severity == Severity.HIGH
+
+    azure = next(item for item in bundled if item.service == "Microsoft Azure")
+    generic = (
+        "The resource you are looking for has been removed, had its name "
+        "changed, or is temporarily unavailable."
+    )
+    assert find_unclaimed_fingerprint(generic, azure) is None
+    gitlab = next(item for item in bundled if item.service == "GitLab Pages")
+    ordinary = evaluate(
+        "a.example.com",
+        "x.gitlab.io",
+        resolves=True,
+        body="The page you're looking for could not be found.",
+        status_code=404,
+        fingerprints=[gitlab],
+    )
+    assert ordinary.severity == Severity.INFO
+
+
 def test_evaluate_evidence_never_claims_resource_is_unclaimed():
     finding = evaluate("sub.example.com", "foo.github.io", resolves=False, fingerprints=SERVICES)
     # Title says "Possible"; evidence/why must stay hedged, not definitive.

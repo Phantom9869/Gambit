@@ -1,21 +1,24 @@
 {
   "version": 1,
-  "source": "Seeded from can-i-take-over-xyz (https://github.com/EdOverflow/can-i-take-over-xyz); unclaimed-response strings are the services' well-known placeholder/error messages.",
+  "source": "Seeded from can-i-take-over-xyz (https://github.com/EdOverflow/can-i-take-over-xyz); unclaimed-response strings are the services' well-known placeholder/error messages. claimable=false means a dangling CNAME alone is not reported as a possible takeover. Generic page text (stock IIS 404s, GitLab's ordinary 404, WordPress marketing copy) is omitted so a live site cannot match it by accident.",
   "services": [
     {
       "service": "GitHub Pages",
       "cname_suffixes": ["github.io"],
-      "fingerprints": ["There isn't a GitHub Pages site here."]
+      "fingerprints": ["There isn't a GitHub Pages site here."],
+      "claimable": true
     },
     {
       "service": "GitLab Pages",
       "cname_suffixes": ["gitlab.io"],
-      "fingerprints": ["The page you're looking for could not be found."]
+      "fingerprints": [],
+      "claimable": false
     },
     {
       "service": "Bitbucket Pages",
       "cname_suffixes": ["bitbucket.io"],
-      "fingerprints": ["Repository not found"]
+      "fingerprints": ["Repository not found"],
+      "claimable": true
     },
     {
       "service": "Amazon S3",
@@ -31,12 +34,14 @@
         "s3-website.ap-northeast-1.amazonaws.com",
         "s3-website-sa-east-1.amazonaws.com"
       ],
-      "fingerprints": ["NoSuchBucket", "The specified bucket does not exist"]
+      "fingerprints": ["NoSuchBucket", "The specified bucket does not exist"],
+      "claimable": true
     },
     {
       "service": "Heroku",
       "cname_suffixes": ["herokuapp.com", "herokudns.com"],
-      "fingerprints": ["No such app", "herokucdn.com/error-pages/no-such-app.html"]
+      "fingerprints": ["No such app", "herokucdn.com/error-pages/no-such-app.html"],
+      "claimable": true
     },
     {
       "service": "Microsoft Azure",
@@ -48,77 +53,92 @@
         "blob.core.windows.net",
         "azureedge.net"
       ],
-      "fingerprints": ["404 Web Site not found", "The resource you are looking for has been removed, had its name changed, or is temporarily unavailable."]
+      "fingerprints": ["404 Web Site not found"],
+      "claimable": false
     },
     {
       "service": "Shopify",
       "cname_suffixes": ["myshopify.com"],
-      "fingerprints": ["Sorry, this shop is currently unavailable."]
+      "fingerprints": ["Sorry, this shop is currently unavailable."],
+      "claimable": false
     },
     {
       "service": "Fastly",
       "cname_suffixes": ["fastly.net"],
-      "fingerprints": ["Fastly error: unknown domain"]
+      "fingerprints": ["Fastly error: unknown domain"],
+      "claimable": false
     },
     {
       "service": "Firebase Hosting",
       "cname_suffixes": ["web.app", "firebaseapp.com"],
-      "fingerprints": ["Site Not Found"]
+      "fingerprints": ["Site Not Found"],
+      "claimable": true
     },
     {
       "service": "Netlify",
       "cname_suffixes": ["netlify.app", "netlify.com"],
-      "fingerprints": ["Not Found - Request ID"]
+      "fingerprints": ["Not Found - Request ID"],
+      "claimable": true
     },
     {
       "service": "Vercel",
       "cname_suffixes": ["vercel.app", "vercel-dns.com"],
-      "fingerprints": ["The deployment could not be found", "DEPLOYMENT_NOT_FOUND"]
+      "fingerprints": ["The deployment could not be found", "DEPLOYMENT_NOT_FOUND"],
+      "claimable": true
     },
     {
       "service": "Webflow",
       "cname_suffixes": ["webflow.io", "proxy-ssl.webflow.com"],
-      "fingerprints": ["The page you are looking for doesn't exist or has been moved"]
+      "fingerprints": ["The page you are looking for doesn't exist or has been moved"],
+      "claimable": false
     },
     {
       "service": "Ghost",
       "cname_suffixes": ["ghost.io"],
-      "fingerprints": ["The thing you were looking for is no longer here, or never was"]
+      "fingerprints": ["The thing you were looking for is no longer here, or never was"],
+      "claimable": true
     },
     {
       "service": "Pantheon",
       "cname_suffixes": ["pantheonsite.io"],
-      "fingerprints": ["The gods are wise, but do not know of the site which you seek."]
+      "fingerprints": ["The gods are wise, but do not know of the site which you seek."],
+      "claimable": true
     },
     {
       "service": "Tumblr",
       "cname_suffixes": ["domains.tumblr.com"],
-      "fingerprints": ["Whatever you were looking for doesn't currently exist at this address."]
+      "fingerprints": ["Whatever you were looking for doesn't currently exist at this address."],
+      "claimable": false
     },
     {
       "service": "WordPress.com",
       "cname_suffixes": ["wordpress.com"],
-      "fingerprints": ["Do you want to register"]
+      "fingerprints": [],
+      "claimable": false
     },
     {
       "service": "Surge",
       "cname_suffixes": ["surge.sh"],
-      "fingerprints": ["project not found"]
+      "fingerprints": ["project not found"],
+      "claimable": true
     },
     {
       "service": "Render",
       "cname_suffixes": ["onrender.com"],
-      "fingerprints": ["Service Suspended", "This service has been suspended."]
+      "fingerprints": ["Service Suspended", "This service has been suspended."],
+      "claimable": false
     },
     {
       "service": "Readthedocs",
       "cname_suffixes": ["readthedocs.io"],
-      "fingerprints": ["Documentation not built yet", "unknown project"]
+      "fingerprints": ["Documentation not built yet", "unknown project"],
+      "claimable": true
     },
     {
       "service": "Zendesk",
       "cname_suffixes": ["zendesk.com"],
-      "fingerprints": ["Help Center closed", "this help center no longer exists"]
+      "fingerprints": ["Help Center closed", "this help center no longer exists"],
+      "claimable": false
     }
   ]
 }

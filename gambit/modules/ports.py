@@ -6,8 +6,6 @@ connection. Severity is a pure function of the port number, which keeps
 the interesting logic testable without any network access.
 """
 
-import socket
-
 from gambit.models import Finding, Severity
 
 __all__ = [
@@ -107,17 +105,32 @@ def evaluate(host: str, port: int) -> Finding:
 
 
 def run(target: str) -> list[Finding]:
-    """Try one TCP connect per port in PORTS and report the open ones."""
+    """Try one TCP connect per port in PORTS and report the open ones.
+
+    An explicit port on ``target`` (``example.com:9090``) is probed too,
+    in addition to :data:`PORTS`. The host is resolved once; every port
+    dials that address list, so a scan does not start one resolver
+    thread per port. The lookup is bounded by :data:`TIMEOUT`. A port
+    outside 1–65535 is not probed: the platform resolver would otherwise
+    truncate it into a different port.
+    """
+    from gambit.net import connect, resolve_ips
     from gambit.pipeline import split_host_port
 
-    hostname, _explicit_port = split_host_port(target)
+    hostname, explicit_port = split_host_port(target)
     host = hostname or target
+    ports = list(PORTS)
+    if explicit_port and explicit_port not in ports:
+        ports.append(explicit_port)
+    ips = resolve_ips(host, TIMEOUT)
+    if not ips:
+        return []
     findings = []
-    for port in PORTS:
+    for port in ports:
         try:
-            with socket.create_connection((host, port), timeout=TIMEOUT):
+            with connect(host, port, TIMEOUT, resolved=ips):
                 pass  # connected == open; send nothing, read nothing
         except OSError:
-            continue  # refused, filtered, timed out, or unresolvable
+            continue  # refused, filtered, or timed out
         findings.append(evaluate(host, port))
     return findings

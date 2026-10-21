@@ -1,7 +1,35 @@
+import ssl
 from datetime import datetime, timezone
 
 from gambit.models import Severity
-from gambit.modules.tls import days_until_expiry, evaluate, parse_cert_datetime
+from gambit.modules.tls import (
+    certificate_from_socket,
+    days_until_expiry,
+    evaluate,
+    parse_cert_datetime,
+)
+
+# Self-signed fixture, not valid after 2020-06-01. Generated offline so the
+# suite does not shell out to openssl (CI includes Windows).
+EXPIRED_PEM = """\
+-----BEGIN CERTIFICATE-----
+MIICrTCCAZWgAwIBAgIBATANBgkqhkiG9w0BAQsFADAaMRgwFgYDVQQDDA9leHBp
+cmVkLmV4YW1wbGUwHhcNMjAwMTAxMDAwMDAwWhcNMjAwNjAxMDAwMDAwWjAaMRgw
+FgYDVQQDDA9leHBpcmVkLmV4YW1wbGUwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAw
+ggEKAoIBAQDCOSGTct1N3/vVYqvU1fi/JC2nNgxArQUgbFnMyzv6U5WmWBCYDYq/
+YKGBUoJegqaRTMHH4dNizxhtIquhvcqW9mu21gnNE4GIn9ND/n0ixuDx5bUdZKLc
+Lw10tOzuT6+t/LxlLTZJP7CV6pC+4eeV0nIOYHpeITUcfA2RhG284jqVPGNWXIbP
+tKYJXFQBVrZhIYZGq4vYaiIIepFighzaUKBBJ6XCFm3eBUTDkMA+25LmhnpoHgr8
+duPlBUWnhaMN0z3drYlT7AFag7H18y6w/VcHHGzYp1/KTtl9kB8k4NAaOsqkccYo
+B8L2f2ADnwJf7JB8X/t8CuI0IP4nwYVtAgMBAAEwDQYJKoZIhvcNAQELBQADggEB
+AFE6U80jH5RXlyK+yUeR+gc58RJ+N0rhweU3AxB3OChEoPYkqnLWaV4Lu8wEX5eE
+MusQ2yK4GusXTJ9tdn83eTVfrieOAz2jhpcnnlHfK8theu9q0XMSKCVNX/5XXTDd
+6z4cXK/w9fhMX0S1mZqKCaub9+Qs11tOrCnZUub2w1o6ttJPhjtI00pQ+vbPCHsE
+vDAo78pnJGhg64snxvyfxYoiOgboBjRDOptr7JGvp9W27XtI1nWNBFyoqlAqhB4u
+qfyo+FW4cCbvIjr3hxkJGQEoDRmxYC9QgA7HtkofWNE/Tj7Okj2sJ3Lt9LzpC0oN
+7lLtSJvVIZ5OQq4Pvy3AR/A=
+-----END CERTIFICATE-----
+"""
 
 NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -74,6 +102,58 @@ def test_no_certificate_info_is_info_not_high():
     assert len(findings) == 1
     assert findings[0].severity == Severity.INFO
     assert evaluate("example.com", None, "TLSv1.3", now=NOW)[0].severity == Severity.INFO
+
+
+def test_getpeercert_empty_dict_is_recovered_from_der():
+    der = ssl.PEM_cert_to_DER_cert(EXPIRED_PEM)
+
+    class Sock:
+        def getpeercert(self, binary_form=False):
+            if binary_form:
+                return der
+            return {}
+
+    cert = certificate_from_socket(Sock())
+    assert cert
+    assert cert.get("notAfter")
+    findings = evaluate(
+        "expired.example",
+        cert,
+        "TLSv1.2",
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    assert any(f.severity == Severity.HIGH and "expired" in f.title.lower() for f in findings)
+
+
+def test_handshake_reads_binary_cert_when_getpeercert_returns_empty(monkeypatch):
+    der = ssl.PEM_cert_to_DER_cert(EXPIRED_PEM)
+
+    class Raw:
+        def close(self):
+            pass
+
+    class TLS:
+        def getpeercert(self, binary_form=False):
+            if binary_form:
+                return der
+            return {}
+
+        def version(self):
+            return "TLSv1.2"
+
+        def close(self):
+            pass
+
+    class Context:
+        def wrap_socket(self, sock, server_hostname=None):
+            return TLS()
+
+    monkeypatch.setattr("gambit.net.connect", lambda *args, **kwargs: Raw())
+    from gambit.modules.tls import _handshake
+
+    cert, protocol = _handshake("expired.example", 443, Context())
+    assert protocol == "TLSv1.2"
+    assert "2020" in cert["notAfter"]
 
 
 def test_hostname_mismatch_and_self_signed_are_info():

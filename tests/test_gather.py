@@ -140,3 +140,36 @@ def test_crtsh_fetch_is_cached_between_run_and_discovery(monkeypatch):
         assert len(calls) == 1  # second call served from cache
     finally:
         gather.clear_crtsh_cache()
+
+
+def test_dns_and_crtsh_drop_an_explicit_port(monkeypatch):
+    seen = []
+
+    def fake_resolve(name, rdtype):
+        seen.append(name)
+        return []
+
+    monkeypatch.setattr(gather, "_resolve", fake_resolve)
+    gather.lookup_dns("example.com:8080")
+    assert seen
+    assert all(":" not in name for name in seen)
+    assert "_dmarc.example.com" in seen
+
+    gather.clear_crtsh_cache()
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return [{"name_value": "www.example.com"}]
+
+    monkeypatch.setattr(gather, "get", lambda url, **kwargs: calls.append(url) or FakeResponse())
+    try:
+        assert gather.discover_subdomains("example.com:8080") == ["www.example.com"]
+    finally:
+        gather.clear_crtsh_cache()
+    assert calls
+    assert ":8080" not in calls[0]
+    assert "q=%25.example.com&" in calls[0]

@@ -21,7 +21,7 @@ import requests
 
 from gambit.http import TIMEOUT, USER_AGENT, get
 from gambit.models import Finding, Severity
-from gambit.pipeline import normalize_host
+from gambit.pipeline import normalize_host, split_host_port
 
 __all__ = [
     "RECORD_TYPES",
@@ -185,6 +185,12 @@ def evaluate_dns(
     return findings
 
 
+def _dns_name(host: str) -> str:
+    """Hostname only: ``example.com:8080`` is not a DNS name."""
+    name, _port = split_host_port(host)
+    return name
+
+
 def _resolve(name: str, rdtype: str) -> list[str]:
     """Resolve one record type; every DNS failure means "no values"."""
     try:
@@ -201,7 +207,7 @@ def lookup_dns(host: str) -> dict[str, list[str]]:
     records of ``_dmarc.<host>`` (stored under ``"DMARC"``). Types with
     no answer are omitted. DNS errors never propagate.
     """
-    name = normalize_host(host)
+    name = _dns_name(host)
     records: dict[str, list[str]] = {}
     if not name:
         return records
@@ -229,7 +235,11 @@ def _fetch_crtsh_subdomains(host: str) -> list[str]:
             raise cached
         return cached
     try:
-        response = get(_CRT_SH_URL.format(host=host), timeout=TIMEOUT)
+        response = get(
+            _CRT_SH_URL.format(host=host),
+            timeout=TIMEOUT,
+            allow_redirects=False,
+        )
         response.raise_for_status()
         names = parse_crtsh(response.json())
     except Exception as exc:
@@ -259,7 +269,7 @@ def discover_subdomains(target: str) -> list[str]:
     called with the target, returns host strings (sorted, deduped,
     apex excluded), and never raises.
     """
-    host = normalize_host(target)
+    host = _dns_name(target)
     if not host:
         return []
     try:
@@ -272,10 +282,11 @@ def discover_subdomains(target: str) -> list[str]:
 def run(target: str) -> list[Finding]:
     """Report DNS records for the target and its crt.sh subdomains."""
     host = normalize_host(target) or target
-    findings = evaluate_dns(host, lookup_dns(host))
+    dns_host = _dns_name(host) or host
+    findings = evaluate_dns(host, lookup_dns(dns_host))
 
     try:
-        names = _fetch_crtsh_subdomains(host)
+        names = _fetch_crtsh_subdomains(dns_host)
     except (requests.RequestException, ValueError) as exc:
         findings.append(
             Finding(
@@ -289,7 +300,7 @@ def run(target: str) -> list[Finding]:
             )
         )
     else:
-        subdomains = _own_subdomains(host, names)
+        subdomains = _own_subdomains(dns_host, names)
         if subdomains:
             findings.append(
                 Finding(

@@ -3,8 +3,10 @@ from gambit.modules.ports import (
     ALT_WEB_PORTS,
     DATABASE_PORTS,
     PORTS,
+    TIMEOUT,
     WEB_PORTS,
     evaluate,
+    run,
     service_for_port,
     severity_for_port,
 )
@@ -42,6 +44,43 @@ def test_service_for_port():
     assert service_for_port(443) == "HTTPS"
     assert service_for_port(5432) == "PostgreSQL"
     assert service_for_port(12345) == "unknown"
+
+
+def test_explicit_port_is_probed_and_out_of_range_port_is_not(monkeypatch):
+    tried = []
+
+    def fake_connect(hostname, port, timeout, resolved=None):
+        tried.append((hostname, port, resolved))
+        raise OSError("closed")
+
+    monkeypatch.setattr("gambit.net.connect", fake_connect)
+    monkeypatch.setattr("gambit.net.resolve_ips", lambda host, timeout: ["203.0.113.1"])
+    assert run("example.com:9090") == []
+    assert ("example.com", 9090, ["203.0.113.1"]) in tried
+    tried.clear()
+    assert run("example.com:99999") == []
+    assert all(port != 99999 and port != 34463 for _host, port, _ips in tried)
+    assert ("example.com", 443, ["203.0.113.1"]) in tried
+
+
+def test_run_resolves_the_host_once(monkeypatch):
+    resolved_calls = []
+    connect_calls = []
+
+    def fake_resolve(host, timeout):
+        resolved_calls.append((host, timeout))
+        return ["203.0.113.1"]
+
+    def fake_connect(hostname, port, timeout, resolved=None):
+        connect_calls.append(resolved)
+        raise OSError("closed")
+
+    monkeypatch.setattr("gambit.net.resolve_ips", fake_resolve)
+    monkeypatch.setattr("gambit.net.connect", fake_connect)
+    assert run("example.com") == []
+    assert resolved_calls == [("example.com", TIMEOUT)]
+    assert len(connect_calls) == len(PORTS)
+    assert all(ips == ["203.0.113.1"] for ips in connect_calls)
 
 
 def test_evaluate_builds_finding_for_open_port():

@@ -13,6 +13,7 @@ contract Gather and the CLI build on:
   finding for that host and everything else keeps going.
 """
 
+import ipaddress
 import time
 from typing import Callable, Iterable, Optional, Protocol
 
@@ -35,8 +36,9 @@ def normalize_host(host: str) -> str:
 
     Strips whitespace, any scheme (``https://``), userinfo, path/query/
     fragment, a leading wildcard (``*.``), and a trailing dot; lowercases
-    the result. A port, if present, is preserved (``example.com:8080``),
-    because existing modules interpolate the host straight into a URL.
+    the result. A valid port is preserved (``example.com:8080``). IPv6
+    literals are rewritten with brackets (``::1`` and ``[::1]`` both
+    become ``[::1]``) so they survive being placed in a URL.
     """
     if not host:
         return ""
@@ -53,6 +55,79 @@ def normalize_host(host: str) -> str:
         value = value[2:]
     if value.endswith("."):
         value = value[:-1]
+    return _canonicalize_ip_literal(value.strip())
+
+
+def _canonicalize_ip_literal(value: str) -> str:
+    """Bracket a bare IPv6 literal. Leave hostnames and ``host:port`` alone."""
+    if not value:
+        return value
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            return value
+        inner = value[1:end]
+        rest = value[end + 1 :]
+        try:
+            ipaddress.IPv6Address(inner)
+        except ValueError:
+            return value
+        if rest.startswith(":") and rest[1:].isdigit():
+            number = int(rest[1:])
+            if 1 <= number <= 65535:
+                return f"[{inner}]:{number}"
+            return f"[{inner}]"
+        if rest == "":
+            return f"[{inner}]"
+        return value
+    if value.count(":") >= 2:
+        try:
+            ipaddress.IPv6Address(value)
+        except ValueError:
+            return value
+        return f"[{value}]"
+    return value
+
+
+def port_out_of_range(host: str) -> bool:
+    """True when ``host`` carries a numeric port outside 1–65535.
+
+    ``getaddrinfo`` truncates such ports (99999 becomes 34463). Callers
+    must refuse them instead of connecting. Checked on the undecorated
+    text, because :func:`normalize_host` drops an invalid bracketed port
+    while rewriting an IPv6 literal.
+    """
+    raw = _host_without_decoration(host)
+    if raw.startswith("[") and "]:" in raw:
+        rest = raw.split("]", 1)[1]
+        if rest.startswith(":") and rest[1:].isdigit():
+            number = int(rest[1:])
+            return not (1 <= number <= 65535)
+        return False
+    if raw.count(":") == 1 and not raw.startswith("["):
+        name, port = raw.split(":", 1)
+        if name and port.isdigit():
+            number = int(port)
+            return not (1 <= number <= 65535)
+    return False
+
+
+def _host_without_decoration(host: str) -> str:
+    """``normalize_host`` steps that do not rewrite IPv6 literals."""
+    if not host:
+        return ""
+    value = str(host).strip()
+    if "://" in value:
+        value = value.split("://", 1)[1]
+    for sep in ("/", "?", "#"):
+        value = value.split(sep, 1)[0]
+    if "@" in value:
+        value = value.rsplit("@", 1)[1]
+    value = value.strip().lower()
+    if value.startswith("*."):
+        value = value[2:]
+    if value.endswith("."):
+        value = value[:-1]
     return value.strip()
 
 
@@ -60,44 +135,95 @@ def split_host_port(host: str) -> tuple[str, int | None]:
     """Split a target into (hostname, port-or-None). No network access.
 
     Accepts anything :func:`normalize_host` accepts (scheme, path,
-    userinfo, trailing dot are stripped first). Socket-level code should
-    use the hostname from here, never the raw target: a raw
-    ``"example.com:8080"`` is not a resolvable name.
+    userinfo, trailing dot are stripped first). The hostname never
+    includes URL brackets or a port: socket calls want ``::1``, not
+    ``[::1]``. A bare IPv6 address is not mistaken for ``host:port``.
+    A numeric port outside 1–65535 is dropped (returned as ``None``)
+    so it cannot be truncated into a different port.
     """
+    if port_out_of_range(host):
+        normalized = normalize_host(host)
+        if normalized.startswith("[") and normalized.endswith("]"):
+            return normalized[1:-1], None
+        if ":" in normalized and not normalized.startswith("["):
+            name, _sep, port = normalized.rpartition(":")
+            if port.isdigit() and name:
+                return name, None
+        return normalized, None
     normalized = normalize_host(host)
+    if normalized.startswith("["):
+        end = normalized.find("]")
+        if end != -1:
+            inner = normalized[1:end]
+            rest = normalized[end + 1 :]
+            if rest.startswith(":") and rest[1:].isdigit():
+                number = int(rest[1:])
+                if 1 <= number <= 65535:
+                    return inner, number
+            if rest == "":
+                return inner, None
     name, sep, port = normalized.rpartition(":")
-    if sep and name and port.isdigit():
-        return name, int(port)
+    if sep and name and port.isdigit() and ":" not in name:
+        number = int(port)
+        if 1 <= number <= 65535:
+            return name, number
+        return name, None
+    if normalized.startswith("[") and normalized.endswith("]"):
+        return normalized[1:-1], None
     return normalized, None
+
+
+def format_url_host(name: str, port: int | None = None) -> str:
+    """Host text safe to place in an ``http(s)://`` URL.
+
+    IPv6 literals are bracketed. ``port`` is appended only when it is
+    inside 1–65535.
+    """
+    try:
+        ipaddress.IPv6Address(name)
+        literal = f"[{name}]"
+    except ValueError:
+        literal = name
+    if port is not None and 1 <= int(port) <= 65535:
+        return f"{literal}:{int(port)}"
+    return literal
 
 
 def host_reachable(host: str, *, timeout: float = 1.0) -> bool:
     """Cheap liveness pre-flight: does the host answer on any web port?
 
     Tries the target's explicit port if it has one, else the common web
-    ports (443, 8443, 80, 8080, 8000, 3000) with a short timeout. This
-    exists so a filtered/dead host costs a few seconds instead of every
-    web module's full timeout stacked together. Also primes the HTTP
-    scheme cache: if only a plain-HTTP port answers, later web modules
-    go straight to HTTP. Only gates web-fetch modules -- takeover and
-    port checks must run even for hosts that answer on no web port.
+    ports (443, 8443, 80, 8080, 8000, 3000) with a short timeout. DNS is
+    bounded by that same timeout. An explicit port outside 1–65535 is
+    refused rather than truncated.
+
+    The open port is remembered for later HTTP fetches: success on 8443
+    (or 8080, 8000, 3000) makes those requests use that port, not 443/80.
+    Only gates web-fetch modules -- takeover and port checks must run
+    even for hosts that answer on no web port.
     """
-    import socket
+    from gambit.http import set_preferred_port, set_preferred_scheme
+    from gambit.net import connect
 
-    from gambit.http import set_preferred_scheme
-
+    if port_out_of_range(host):
+        return False
     name, explicit_port = split_host_port(host)
     if not name:
         return False
     ports = [explicit_port] if explicit_port else [443, 8443, 80, 8080, 8000, 3000]
     for port in ports:
+        if port is None:
+            continue
         try:
-            with socket.create_connection((name, port), timeout=timeout):
+            with connect(name, port, timeout):
                 pass
         except OSError:
             continue
         if explicit_port is None:
             set_preferred_scheme(host, "https" if port in (443, 8443) else "http")
+            # 443 and 80 are the scheme defaults. Any other open port has
+            # to be written into the URL or the fetch hits a closed port.
+            set_preferred_port(host, None if port in (443, 80) else port)
         return True
     return False
 
@@ -275,8 +401,10 @@ __all__ = [
     "ModuleLike",
     "dedupe_hosts",
     "discover_hosts",
+    "format_url_host",
     "host_reachable",
     "normalize_host",
+    "port_out_of_range",
     "run_for_host",
     "run_modules_for_host",
     "run_pipeline",

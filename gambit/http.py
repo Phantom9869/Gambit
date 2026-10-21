@@ -12,17 +12,54 @@ files. The scheme that works for a host is remembered for the rest of
 the process, so only the first module to touch an HTTP-only host pays
 for the failed HTTPS attempt.
 
-Redirects are followed only when the next URL stays on the same host and
-every resolved address is globally routable, and only up to
-:data:`MAX_REDIRECTS` hops. Response bodies are streamed and capped at
-:data:`MAX_BODY` bytes unless the caller is reading the stream itself.
+Redirects are followed only up to :data:`MAX_REDIRECTS` hops, and only
+when the host *requests will connect to* stays the same. That host is
+taken from ``requests``' prepared URL parsed with ``urllib3``, because
+``urllib.parse`` and urllib3 disagree on some Location values (a
+backslash in the authority is the one that turns into an SSRF). The
+TCP connection is opened to the addresses vetted for that host, not to
+whatever a second lookup would return. A redirect whose addresses are
+not all public is refused, except when the original target is itself a
+non-public address literal — an internal scan of 10.x, 192.168.x, or
+127.0.0.1 must still be able to follow HTTP to HTTPS. A name that
+merely resolves to a private address is a pivot and is not followed,
+including names that exist only in the hosts file.
+
+``HTTP(S)_PROXY`` / ``proxies=`` skips the pin: a proxy resolves the
+name itself. Redirects are not followed on that path. A lookup that
+outruns its deadline leaves a daemon thread blocked in ``getaddrinfo``
+until the libc call returns; the scan does not wait.
+
+Response bodies are streamed and capped at :data:`MAX_BODY` bytes unless
+the caller is reading the stream itself.
 """
 
-from urllib.parse import urljoin, urlsplit
+import ipaddress
+import os
+import socket
+from urllib.parse import urljoin
 
 import requests
+import urllib3.connection
+import urllib3.exceptions
+from urllib3.util.url import parse_url
 
-from gambit.net import is_public_ip, resolve_ips
+from gambit.net import is_ip_address, is_public_ip, resolve_ips
+
+# Identity of the real requests entry point. Tests replace
+# ``gambit.http.requests.request``; when they have, pinning is skipped
+# and that double is called instead.
+_ORIGINAL_REQUEST = requests.request
+
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_PROXY_ENV_VARS = (
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+)
 
 USER_AGENT = (
     "GAMBIT/0.1 (+https://github.com/Phantom9869/gambit; authorized testing only)"
@@ -51,9 +88,13 @@ def request(
     other keyword is forwarded to :func:`requests.request`, except:
 
     * ``allow_redirects`` (default True) follows only same-host redirects
-      whose resolved addresses are all public, and at most
-      :data:`MAX_REDIRECTS` of them. A cross-host or private redirect is
-      returned as the redirect response and is not fetched.
+      whose vetted addresses are all public — or whose original target
+      is a non-public address literal — and at most :data:`MAX_REDIRECTS`
+      of them. The host compared is the one the next request connects
+      to. A cross-host redirect, a public-name-to-private pivot, or a
+      Location containing a backslash, whitespace, or a control
+      character is returned as the redirect response and is not fetched.
+      Each connection uses the addresses that decision vetted.
     * ``max_bytes`` (default :data:`MAX_BODY`) caps how much of the final
       body is buffered. Ignored when ``stream=True``; the caller then
       reads the body itself.
@@ -71,28 +112,69 @@ def request(
     max_bytes = _as_limit(kwargs.pop("max_bytes", MAX_BODY))
     kwargs["allow_redirects"] = False
     kwargs["stream"] = True
+    # A proxy resolves the name itself, so the vetted address would not
+    # be the address that is connected. One direct request is sent and
+    # redirects are not followed.
+    proxied = bool(kwargs.get("proxies")) or _env_proxy_configured()
+    use_pin = requests.request is _ORIGINAL_REQUEST and not proxied
+    follow = allow_redirects and not proxied
 
     current = url
     current_method = method
+    original_host: str | None = None
+    vetted: list[str] | None = None
     hops = 0
     while True:
-        response = requests.request(
-            current_method, current, headers=merged, timeout=timeout, **kwargs
-        )
-        _stamp_redirect(response, hops, current)
-        if not allow_redirects or hops >= MAX_REDIRECTS:
+        send_url = current
+        if use_pin:
+            if vetted is None:
+                target = _prepare_target(current)
+                if target is None:
+                    raise requests.InvalidURL(f"refusing ambiguous URL {current!r}")
+                send_url, host = target
+                if original_host is None:
+                    original_host = host
+                vetted = resolve_ips(_dns_name(host), _timeout_seconds(timeout))
+                if not vetted:
+                    raise requests.ConnectionError(f"could not resolve {host}")
+            response = _request_pinned(
+                current_method,
+                send_url,
+                headers=merged,
+                timeout=timeout,
+                ips=vetted,
+                **kwargs,
+            )
+        else:
+            if original_host is None:
+                target = _prepare_target(current)
+                original_host = target[1] if target else ""
+            response = requests.request(
+                current_method, current, headers=merged, timeout=timeout, **kwargs
+            )
+            send_url = current
+
+        _stamp_redirect(response, hops, send_url)
+        vetted = None
+        if not follow or hops >= MAX_REDIRECTS:
             break
         status = getattr(response, "status_code", 0) or 0
         location = _location_header(response)
-        if status not in (301, 302, 303, 307, 308) or not location:
+        if status not in _REDIRECT_STATUSES or not _location_is_acceptable(location):
             break
-        nxt = urljoin(current, location.strip())
-        if not _redirect_is_safe(current, nxt, timeout):
+        target = _prepare_target(urljoin(send_url, location.strip()))
+        if target is None or not original_host:
+            break
+        next_url, next_host = target
+        vetted = _vetted_redirect_ips(original_host, next_host, timeout)
+        if vetted is None:
             break
         _close_quietly(response)
         if status == 303:
             current_method = "GET"
-        current = nxt
+        current = next_url
+        if not use_pin:
+            vetted = None
         hops += 1
     if not caller_streams:
         _buffer_limited(response, max_bytes)
@@ -296,21 +378,254 @@ def _location_header(response) -> str:
     return ""
 
 
-def _redirect_is_safe(current: str, nxt: str, timeout) -> bool:
-    """Same host, http(s) only, and every resolved address globally routable."""
-    new = urlsplit(nxt)
-    old = urlsplit(current)
-    if new.scheme not in ("http", "https") or not new.hostname:
+def _env_proxy_configured() -> bool:
+    return any(os.environ.get(name) for name in _PROXY_ENV_VARS)
+
+
+def _location_is_acceptable(location: str) -> bool:
+    """Reject Location values whose bytes parsers disagree on.
+
+    A raw backslash ends the authority for urllib3 and is only userinfo
+    for ``urllib.parse``, so ``http://127.0.0.1\\@example.com/`` is
+    checked as example.com and fetched as 127.0.0.1. Whitespace and
+    controls are stripped by one parser and kept by the other. Outer
+    header whitespace is ignored; anything inside the value is refused.
+    """
+    if not location:
         return False
-    current_host = (old.hostname or "").lower().rstrip(".")
-    next_host = new.hostname.lower().rstrip(".")
-    if not current_host or current_host != next_host:
+    value = location.strip()
+    if not value:
         return False
+    for char in value:
+        code = ord(char)
+        if char == "\\" or char.isspace() or code < 32 or code == 127:
+            return False
+    return True
+
+
+def _prepare_target(url: str) -> tuple[str, str] | None:
+    """Return ``(prepared_url, host)`` for the URL requests would connect to.
+
+    ``PreparedRequest.url`` is what the adapter sends, and urllib3 parses
+    that string again with :func:`urllib3.util.parse_url`. The host of
+    that parse is the connection host. A URL that does not survive a
+    second prepare unchanged is ambiguous and is refused.
+    """
     try:
-        ips = resolve_ips(next_host, _timeout_seconds(timeout))
+        prepared_url = requests.Request("GET", url).prepare().url
+        if not isinstance(prepared_url, str) or not prepared_url:
+            return None
+        if requests.Request("GET", prepared_url).prepare().url != prepared_url:
+            return None
+        parsed = parse_url(prepared_url)
+    except (
+        requests.RequestException,
+        urllib3.exceptions.LocationParseError,
+        ValueError,
+    ):
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.host:
+        return None
+    return prepared_url, parsed.host
+
+
+def _host_key(host: str) -> str:
+    """Comparable host: lower-case, no trailing dot, no IPv6 brackets."""
+    name = host.strip().lower().rstrip(".")
+    if len(name) >= 2 and name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    try:
+        return ipaddress.ip_address(name).compressed
+    except ValueError:
+        return name
+
+
+def _dns_name(host: str) -> str:
+    """Host to resolve. Brackets are stripped; a trailing dot stays on names.
+
+    The dot marks an absolute DNS name (no search-list suffix). It is
+    removed only when what remains is an address literal.
+    """
+    name = host.strip()
+    if len(name) >= 2 and name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    stripped = name.rstrip(".")
+    if is_ip_address(stripped):
+        return stripped
+    return name
+
+
+def _policy_ip(ip: str) -> str:
+    """Address without an IPv6 zone id, for :func:`is_public_ip`."""
+    return ip.split("%", 1)[0]
+
+
+def _is_private_literal(host: str) -> bool:
+    """True when ``host`` is an address literal that is not globally routable."""
+    key = _host_key(host)
+    return is_ip_address(key) and not is_public_ip(key)
+
+
+def _vetted_redirect_ips(original_host: str, next_host: str, timeout) -> list[str] | None:
+    """Addresses the redirect may be connected to, or None to stop.
+
+    The next host must be the original host (the one the scan was aimed
+    at). Every address must be public, unless that original host is
+    itself a non-public literal — then a same-host hop such as HTTP to
+    HTTPS is allowed, and a mix of public and private addresses is not.
+    """
+    if not original_host or not next_host:
+        return None
+    if _host_key(original_host) != _host_key(next_host):
+        return None
+    try:
+        ips = resolve_ips(_dns_name(next_host), _timeout_seconds(timeout))
     except Exception:
-        return False
-    return bool(ips) and all(is_public_ip(ip) for ip in ips)
+        return None
+    if not ips:
+        return None
+    public = [is_public_ip(_policy_ip(ip)) for ip in ips]
+    if all(public):
+        return list(ips)
+    if _is_private_literal(original_host) and not any(public):
+        return list(ips)
+    return None
+
+
+def _open_tcp_socket(ip: str, port: int, timeout, source_address, socket_options):
+    """Connect to ``ip`` without another name lookup."""
+    raw = ip
+    scope = 0
+    if "%" in ip:
+        raw, zone = ip.split("%", 1)
+        if zone.isdigit():
+            scope = int(zone)
+        else:
+            try:
+                scope = socket.if_nametoindex(zone)
+            except OSError:
+                scope = 0
+    addr = ipaddress.ip_address(raw)
+    family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if socket_options:
+            for level, opt, value in socket_options:
+                sock.setsockopt(level, opt, value)
+        if timeout is not None:
+            sock.settimeout(float(timeout))
+        if source_address:
+            sock.bind(source_address)
+        if addr.version == 6:
+            sock.connect((raw, int(port), 0, scope))
+        else:
+            sock.connect((raw, int(port)))
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+def _pinned_connection_class(base, ips: tuple[str, ...]):
+    """Connection class that dials ``ips`` and keeps ``host`` for Host/SNI."""
+
+    class Pinned(base):
+        def _new_conn(self):
+            last: Exception | None = None
+            for ip in ips:
+                try:
+                    return _open_tcp_socket(
+                        ip,
+                        self.port,
+                        self.timeout,
+                        self.source_address,
+                        self.socket_options,
+                    )
+                except TimeoutError as exc:
+                    last = urllib3.exceptions.ConnectTimeoutError(
+                        self,
+                        f"Connection to {ip} timed out. (connect timeout={self.timeout}): {exc}",
+                    )
+                except OSError as exc:
+                    last = urllib3.exceptions.NewConnectionError(
+                        self, f"Failed to establish a new connection: {exc}"
+                    )
+            if last is None:
+                raise urllib3.exceptions.NewConnectionError(
+                    self, "no vetted address to connect to"
+                )
+            raise last
+
+    Pinned.__name__ = f"Pinned{base.__name__}"
+    return Pinned
+
+
+class _PinnedHTTPConnectionPool(urllib3.HTTPConnectionPool):
+    def __init__(self, host, port=None, *, gambit_pinned_ips=None, **kwargs):
+        super().__init__(host, port, **kwargs)
+        if gambit_pinned_ips:
+            self.ConnectionCls = _pinned_connection_class(
+                urllib3.connection.HTTPConnection, tuple(gambit_pinned_ips)
+            )
+
+
+class _PinnedHTTPSConnectionPool(urllib3.HTTPSConnectionPool):
+    def __init__(self, host, port=None, *, gambit_pinned_ips=None, **kwargs):
+        super().__init__(host, port, **kwargs)
+        if gambit_pinned_ips:
+            self.ConnectionCls = _pinned_connection_class(
+                urllib3.connection.HTTPSConnection, tuple(gambit_pinned_ips)
+            )
+
+
+class _PinnedPoolManager(urllib3.PoolManager):
+    def __init__(self, pinned_ips, **kwargs):
+        super().__init__(**kwargs)
+        self._gambit_pinned_ips = tuple(pinned_ips)
+        self.pool_classes_by_scheme = {
+            "http": _PinnedHTTPConnectionPool,
+            "https": _PinnedHTTPSConnectionPool,
+        }
+
+    def _new_pool(self, scheme, host, port, request_context=None):
+        context = (
+            self.connection_pool_kw.copy()
+            if request_context is None
+            else request_context.copy()
+        )
+        context["gambit_pinned_ips"] = self._gambit_pinned_ips
+        return super()._new_pool(scheme, host, port, context)
+
+
+class _PinnedAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, pinned_ips, **kwargs):
+        self._pinned_ips = tuple(pinned_ips)
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        self._pool_connections = connections
+        self._pool_maxsize = maxsize
+        self._pool_block = block
+        self.poolmanager = _PinnedPoolManager(
+            self._pinned_ips,
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs,
+        )
+
+
+def _request_pinned(method, url, *, headers, timeout, ips, **kwargs):
+    """Send one request, dialing ``ips`` instead of resolving ``url`` again."""
+    session = requests.Session()
+    session.trust_env = False
+    adapter = _PinnedAdapter(ips)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    try:
+        return session.request(method, url, headers=headers, timeout=timeout, **kwargs)
+    finally:
+        session.close()
 
 
 def _close_quietly(response) -> None:

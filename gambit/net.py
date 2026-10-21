@@ -96,19 +96,27 @@ def _resolve_system(hostname: str) -> list[str]:
     return found
 
 
-def connect(hostname: str, port: int, timeout: float):
+def connect(
+    hostname: str,
+    port: int,
+    timeout: float,
+    *,
+    resolved: list[str] | None = None,
+):
     """TCP-connect to ``hostname``:``port`` with DNS bounded by ``timeout``.
 
     The socket is connected to a resolved address, never to a name, so
     the second ``getaddrinfo`` only parses an IP literal. Ports outside
     1–65535 raise ``OSError`` instead of being truncated by the resolver.
-    Raises ``OSError`` when the name does not resolve or every address
-    refuses the connection.
+    Pass ``resolved`` to dial addresses already looked up (one lookup
+    for many ports). ``None`` resolves ``hostname``; an empty list does
+    not, and raises. Raises ``OSError`` when the name does not resolve
+    or every address refuses the connection.
     """
     number = int(port)
     if number < 1 or number > 65535:
         raise OSError(f"port out of range: {port}")
-    ips = resolve_ips(hostname, timeout)
+    ips = list(resolved) if resolved is not None else resolve_ips(hostname, timeout)
     if not ips:
         raise OSError(f"could not resolve {hostname}")
     last: OSError | None = None

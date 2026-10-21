@@ -5,13 +5,11 @@ import subprocess
 import tempfile
 import threading
 import time
-import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 import requests
-from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util.url import parse_url
 
 import gambit.http as http
@@ -36,6 +34,10 @@ def clean_cache(monkeypatch):
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
     ):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -182,7 +184,18 @@ def test_same_host_redirect_followed_when_address_is_public(monkeypatch):
 
 
 def test_same_host_redirect_to_a_private_address_is_not_followed(monkeypatch):
-    monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["127.0.0.1"])
+    """Public first, private on the redirect: that pivot is not followed.
+
+    A name whose every address is non-public is a private target and
+    would be followed. This mock is public for the classification lookup
+    and private for the hop, which is the rebind the check still blocks.
+    """
+    answers = iter([["93.184.216.34"], ["127.0.0.1"]])
+
+    def resolve(host, timeout):
+        return next(answers)
+
+    monkeypatch.setattr(http, "resolve_ips", resolve)
     calls = []
 
     def fake_request(method, url, headers=None, timeout=None, **kwargs):
@@ -292,6 +305,15 @@ def _serve(routes):
 def _close_server(server):
     server.shutdown()
     server.server_close()
+
+
+def _wait_until(predicate, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 class _Listener(threading.Thread):
@@ -540,21 +562,27 @@ def test_private_target_does_not_follow_a_cross_host_redirect():
     assert [path for path, _host in server.seen] == ["/r"]
 
 
-def test_public_name_resolving_private_does_not_follow_redirect(monkeypatch):
+def test_private_only_name_follows_same_host_redirect(monkeypatch):
+    """A name that resolves only to non-public addresses is the scan target.
+
+    Hosts-file lab names (target.htb -> 10.x) and localhost are in this
+    bucket. The redirect is resolved again and must stay non-public.
+    """
     server = _serve({})
     port = server.server_address[1]
     server.routes = {
-        "/r": (302, {"Location": f"http://example.com:{port}/secret"}, b""),
-        "/secret": (200, {}, b"nope"),
+        "/r": (302, {"Location": f"http://target.htb:{port}/secret"}, b""),
+        "/secret": (200, {}, b"lab"),
     }
     monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["127.0.0.1"])
     try:
-        response = http.get(f"http://example.com:{port}/r", timeout=2)
+        response = http.get(f"http://target.htb:{port}/r", timeout=2)
     finally:
         _close_server(server)
-    assert response.status_code == 302
-    assert response.gambit_redirects == 0
-    assert [path for path, _host in server.seen] == ["/r"]
+    assert response.status_code == 200
+    assert response.content == b"lab"
+    assert response.gambit_redirects == 1
+    assert [path for path, _host in server.seen] == ["/r", "/secret"]
 
 
 def test_connection_uses_vetted_ips_when_getaddrinfo_changes(monkeypatch):
@@ -630,67 +658,341 @@ def test_configured_proxy_does_not_follow_redirects(monkeypatch):
     assert response.gambit_redirects == 0
 
 
-def test_private_literal_follows_http_to_https_against_a_local_server():
+def test_redirect_to_a_different_high_port_is_not_followed():
+    dest = _serve({"/x": (200, {}, b"secret")})
+    dest_port = dest.server_address[1]
+    origin = _serve(
+        {
+            "/r": (
+                301,
+                {"Location": f"http://127.0.0.1:{dest_port}/x"},
+                b"stay",
+            )
+        }
+    )
+    try:
+        response = http.get(
+            f"http://127.0.0.1:{origin.server_address[1]}/r", timeout=2
+        )
+    finally:
+        _close_server(origin)
+        _close_server(dest)
+    assert response.status_code == 301
+    assert response.gambit_redirects == 0
+    assert response.content == b"stay"
+    assert dest.seen == []
+
+
+def test_redirect_port_is_the_same_port_or_the_http_https_pair(monkeypatch):
+    monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["10.1.2.3"])
+    calls = []
+    location = {"value": "/"}
+
+    def fake_request(method, url, headers=None, timeout=None, **kwargs):
+        calls.append(url)
+
+        class Response:
+            def __init__(self, url):
+                self.url = url
+                done = url.endswith("/x")
+                self.status_code = 200 if done else 302
+                self.headers = {} if done else {"Location": location["value"]}
+
+            def close(self):
+                return None
+
+            def iter_content(self, chunk_size=8192):
+                yield b"ok"
+
+        return Response(url)
+
+    monkeypatch.setattr(http.requests, "request", fake_request)
+
+    location["value"] = "https://127.0.0.1:8080/x"
+    response = http.get("http://127.0.0.1:8080/r")
+    assert response.gambit_redirects == 1
+    assert calls[-1].startswith("https://127.0.0.1:8080/")
+
+    calls.clear()
+    location["value"] = "http://127.0.0.1:9090/x"
+    response = http.get("http://127.0.0.1:8080/r")
+    assert calls == ["http://127.0.0.1:8080/r"]
+    assert response.status_code == 302
+    assert response.gambit_redirects == 0
+
+    calls.clear()
+    location["value"] = "https://10.1.2.3/x"
+    response = http.get("http://10.1.2.3/r")
+    assert response.gambit_redirects == 1
+    assert calls[-1].startswith("https://10.1.2.3/")
+
+
+def test_failed_redirect_hop_returns_the_redirect(monkeypatch):
+    monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["93.184.216.34"])
+    calls = []
+
+    def fake_request(method, url, headers=None, timeout=None, **kwargs):
+        calls.append(url)
+        if len(calls) > 1:
+            raise requests.ConnectionError("hop failed")
+
+        class Response:
+            status_code = 302
+            headers = {"Location": "http://example.com/next"}
+
+            def __init__(self):
+                self.url = url
+
+            def close(self):
+                return None
+
+            def iter_content(self, chunk_size=8192):
+                yield b"stay"
+
+        return Response()
+
+    monkeypatch.setattr(http.requests, "request", fake_request)
+    response = http.get("http://example.com/")
+    assert calls == ["http://example.com/", "http://example.com/next"]
+    assert response.status_code == 302
+    assert response.gambit_redirects == 0
+    assert response._content == b"stay"
+
+
+def test_localhost_same_host_redirect_is_followed():
+    server = _serve(
+        {
+            "/r": (302, {"Location": "/x"}, b""),
+            "/x": (200, {}, b"local"),
+        }
+    )
+    port = server.server_address[1]
+    try:
+        response = http.get(f"http://localhost:{port}/r", timeout=2)
+    finally:
+        _close_server(server)
+    assert response.status_code == 200
+    assert response.content == b"local"
+    assert response.gambit_redirects == 1
+    assert [path for path, _host in server.seen] == ["/r", "/x"]
+
+
+def test_no_proxy_host_keeps_pinning_and_follows_redirects(monkeypatch):
+    server = _serve(
+        {
+            "/r": (302, {"Location": "/x"}, b""),
+            "/x": (200, {}, b"direct"),
+        }
+    )
+    port = server.server_address[1]
+
+    def blackhole(host, port, family=0, type=0, proto=0, flags=0):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.1", port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", blackhole)
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    try:
+        response = http.get(f"http://127.0.0.1:{port}/r", timeout=2)
+    finally:
+        _close_server(server)
+    assert response.status_code == 200
+    assert response.content == b"direct"
+    assert response.gambit_redirects == 1
+    assert [path for path, _host in server.seen] == ["/r", "/x"]
+
+
+def test_pinned_path_honours_env_ca_bundle_without_trusting_proxies(monkeypatch):
+    captured = []
+
+    class FakeSession:
+        def __init__(self):
+            self.trust_env = True
+
+        def mount(self, prefix, adapter):
+            return None
+
+        def request(self, method, url, **kwargs):
+            captured.append(
+                (
+                    self.trust_env,
+                    kwargs.get("verify", "missing"),
+                    kwargs.get("proxies"),
+                )
+            )
+
+            class Response:
+                status_code = 200
+                headers = {}
+
+                def __init__(self, url):
+                    self.url = url
+
+                def close(self):
+                    return None
+
+                def iter_content(self, chunk_size=8192):
+                    yield b"ok"
+
+            return Response(url)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(http.requests, "Session", FakeSession)
+    monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["93.184.216.34"])
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/tmp/gambit-test-ca.pem")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+    monkeypatch.setenv("no_proxy", "example.com")
+    http.get("https://example.com/")
+    assert captured[-1] == (False, "/tmp/gambit-test-ca.pem", None)
+
+    http.get("https://example.com/", verify=False)
+    assert captured[-1][1] is False
+
+    http.get("https://example.com/", verify="/explicit.pem")
+    assert captured[-1][1] == "/explicit.pem"
+
+    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+    monkeypatch.setenv("CURL_CA_BUNDLE", "/tmp/curl-ca.pem")
+    http.get("https://example.com/")
+    assert captured[-1][1] == "/tmp/curl-ca.pem"
+
+
+def test_tls_verify_failure_is_not_retried_over_http(monkeypatch):
+    attempts = []
+
+    def fake_request(method, url, **kwargs):
+        attempts.append(url)
+        if url.startswith("https://"):
+            raise requests.exceptions.SSLError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch"
+            )
+        return FakeResponse(url)
+
+    monkeypatch.setattr(http, "request", fake_request)
+    with pytest.raises(requests.exceptions.SSLError, match="not retrying over HTTP"):
+        http.get_for_host("internal.example")
+    assert attempts == ["https://internal.example"]
+    assert http.preferred_scheme("internal.example") is None
+
+
+def test_tls_protocol_mismatch_still_falls_back_to_http(monkeypatch):
+    attempts = []
+
+    def fake_request(method, url, **kwargs):
+        attempts.append(url)
+        if url.startswith("https://"):
+            raise requests.exceptions.SSLError(
+                "[SSL: WRONG_VERSION_NUMBER] wrong version number"
+            )
+        return FakeResponse(url)
+
+    monkeypatch.setattr(http, "request", fake_request)
+    response = http.get_for_host("plain.example")
+    assert response.url == "http://plain.example"
+    assert attempts == ["https://plain.example", "http://plain.example"]
+
+
+def _mint_hostname_cert(directory: Path, hostname: str) -> tuple[Path, Path, Path]:
+    """CA plus a server cert whose SAN is ``hostname``. Returns (ca, cert, key)."""
     openssl = shutil.which("openssl")
     if openssl is None:
         pytest.skip("openssl is required to mint a certificate")
+    ca_key = directory / "ca.key"
+    ca_cert = directory / "ca.pem"
+    srv_key = directory / "srv.key"
+    csr = directory / "srv.csr"
+    cert = directory / "srv.pem"
+    subprocess.run(
+        [
+            openssl, "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(ca_key), "-out", str(ca_cert),
+            "-days", "1", "-nodes", "-subj", "/CN=Gambit Test CA",
+        ],
+        check=True, capture_output=True, cwd=directory,
+    )
+    subprocess.run(
+        [
+            openssl, "req", "-newkey", "rsa:2048",
+            "-keyout", str(srv_key), "-out", str(csr),
+            "-nodes", "-subj", f"/CN={hostname}",
+            "-addext", f"subjectAltName=DNS:{hostname}",
+        ],
+        check=True, capture_output=True, cwd=directory,
+    )
+    subprocess.run(
+        [
+            openssl, "x509", "-req", "-in", str(csr),
+            "-CA", str(ca_cert), "-CAkey", str(ca_key),
+            "-CAcreateserial", "-out", str(cert),
+            "-days", "1", "-copy_extensions", "copy",
+        ],
+        check=True, capture_output=True, cwd=directory,
+    )
+    return ca_cert, cert, srv_key
+
+
+class _CountingServer(ThreadingHTTPServer):
+    def __init__(self, server_address, handler):
+        super().__init__(server_address, handler)
+        self.accepts = 0
+        self.routes = {}
+        self.seen = []
+
+    def get_request(self):
+        # Hostname rejection can abort the handshake inside accept().
+        # Count that too: it is still one TCP connection, and a second
+        # connection would mean the client retried (for example over HTTP).
+        try:
+            conn, addr = super().get_request()
+        except ssl.SSLError:
+            self.accepts += 1
+            raise
+        self.accepts += 1
+        return conn, addr
+
+
+def test_pinned_https_honours_requests_ca_bundle_and_rejects_hostname_mismatch(monkeypatch):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is required to mint a certificate")
     with tempfile.TemporaryDirectory() as tmp:
-        directory = Path(tmp)
-        key = directory / "key.pem"
-        cert = directory / "cert.pem"
-        subprocess.run(
-            [
-                openssl,
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                str(key),
-                "-out",
-                str(cert),
-                "-days",
-                "1",
-                "-nodes",
-                "-subj",
-                "/CN=127.0.0.1",
-                "-addext",
-                "subjectAltName=IP:127.0.0.1",
-            ],
-            check=True,
-            capture_output=True,
-        )
-        https = ThreadingHTTPServer(("127.0.0.1", 0), _RecordingHandler)
-        https.routes = {"/x": (200, {}, b"secure")}
-        https.seen = []
+        ca_cert, cert, key = _mint_hostname_cert(Path(tmp), "pinned.gambit.test")
+        server = _CountingServer(("127.0.0.1", 0), _RecordingHandler)
+        server.routes = {"/": (200, {}, b"trusted")}
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert, key)
-        https.socket = context.wrap_socket(https.socket, server_side=True)
-        https_port = https.server_address[1]
-        https_thread = threading.Thread(target=https.serve_forever, daemon=True)
-        https_thread.start()
-        http_server = _serve(
-            {
-                "/r": (
-                    301,
-                    {"Location": f"https://127.0.0.1:{https_port}/x"},
-                    b"",
-                )
-            }
-        )
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["127.0.0.1"])
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(ca_cert))
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", InsecureRequestWarning)
-                response = http.get(
-                    f"http://127.0.0.1:{http_server.server_address[1]}/r",
-                    timeout=2,
-                    verify=False,
-                )
+            response = http.get(f"https://pinned.gambit.test:{port}/", timeout=2)
+            assert response.status_code == 200
+            assert response.content == b"trusted"
+            assert _wait_until(lambda: server.accepts >= 1)
+            good = server.accepts
+
+            with pytest.raises(requests.exceptions.SSLError):
+                http.get(f"https://wrong.gambit.test:{port}/", timeout=2)
+            assert _wait_until(lambda: server.accepts >= good + 1)
+            after_mismatch = server.accepts
+            assert after_mismatch == good + 1
+
+            with pytest.raises(
+                requests.exceptions.SSLError, match="not retrying over HTTP"
+            ):
+                http.get_for_host(f"wrong.gambit.test:{port}", timeout=2)
+            # One TLS handshake. Plain HTTP on the same port is not tried.
+            assert _wait_until(lambda: server.accepts >= after_mismatch + 1)
+            assert server.accepts == after_mismatch + 1
+
+            monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+            with pytest.raises(requests.exceptions.SSLError):
+                http.get(f"https://pinned.gambit.test:{port}/", timeout=2)
         finally:
-            _close_server(http_server)
-            https.shutdown()
-            https.server_close()
-    assert response.status_code == 200
-    assert response.content == b"secure"
-    assert response.gambit_redirects == 1
-    assert response.gambit_final_url == f"https://127.0.0.1:{https_port}/x"
+            server.shutdown()
+            server.server_close()

@@ -94,6 +94,30 @@ def test_connect_reaches_localhost_from_the_system_resolver():
         listener.close()
 
 
+def test_connect_uses_supplied_addresses_without_resolving(monkeypatch):
+    seen = []
+
+    def fail_getaddrinfo(*args, **kwargs):
+        raise AssertionError("getaddrinfo should not be called")
+
+    def fake_create_connection(address, timeout=None):
+        seen.append((address, timeout))
+
+        class Sock:
+            def close(self):
+                pass
+
+        return Sock()
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail_getaddrinfo)
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    sock = connect("example.com", 80, 1.5, resolved=["203.0.113.5"])
+    assert sock is not None
+    assert seen == [(("203.0.113.5", 80), 1.5)]
+    with pytest.raises(OSError):
+        connect("example.com", 80, 1.5, resolved=[])
+
+
 def test_connect_refuses_a_port_that_would_wrap(monkeypatch):
     called = []
     monkeypatch.setattr(

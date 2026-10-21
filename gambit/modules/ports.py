@@ -108,11 +108,13 @@ def run(target: str) -> list[Finding]:
     """Try one TCP connect per port in PORTS and report the open ones.
 
     An explicit port on ``target`` (``example.com:9090``) is probed too,
-    in addition to :data:`PORTS`. DNS for each connect is bounded by
-    :data:`TIMEOUT`. A port outside 1–65535 is not probed: the platform
-    resolver would otherwise truncate it into a different port.
+    in addition to :data:`PORTS`. The host is resolved once; every port
+    dials that address list, so a scan does not start one resolver
+    thread per port. The lookup is bounded by :data:`TIMEOUT`. A port
+    outside 1–65535 is not probed: the platform resolver would otherwise
+    truncate it into a different port.
     """
-    from gambit.net import connect
+    from gambit.net import connect, resolve_ips
     from gambit.pipeline import split_host_port
 
     hostname, explicit_port = split_host_port(target)
@@ -120,12 +122,15 @@ def run(target: str) -> list[Finding]:
     ports = list(PORTS)
     if explicit_port and explicit_port not in ports:
         ports.append(explicit_port)
+    ips = resolve_ips(host, TIMEOUT)
+    if not ips:
+        return []
     findings = []
     for port in ports:
         try:
-            with connect(host, port, TIMEOUT):
+            with connect(host, port, TIMEOUT, resolved=ips):
                 pass  # connected == open; send nothing, read nothing
         except OSError:
-            continue  # refused, filtered, timed out, or unresolvable
+            continue  # refused, filtered, or timed out
         findings.append(evaluate(host, port))
     return findings

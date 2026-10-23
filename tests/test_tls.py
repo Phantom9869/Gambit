@@ -1,7 +1,9 @@
 import ssl
 from datetime import datetime, timezone
 
+import gambit.http as http
 from gambit.models import Severity
+from gambit.modules import tls as tls_module
 from gambit.modules.tls import (
     certificate_from_socket,
     days_until_expiry,
@@ -154,6 +156,23 @@ def test_handshake_reads_binary_cert_when_getpeercert_returns_empty(monkeypatch)
     cert, protocol = _handshake("expired.example", 443, Context())
     assert protocol == "TLSv1.2"
     assert "2020" in cert["notAfter"]
+
+
+def test_insecure_tls_handshake_does_not_verify(monkeypatch):
+    seen = []
+
+    def fake_handshake(hostname, port, context):
+        seen.append(context.verify_mode)
+        return ({"notAfter": "Dec  1 00:00:00 2099 GMT"}, "TLSv1.3")
+
+    monkeypatch.setattr(tls_module, "_handshake", fake_handshake)
+    http.set_tls_verification(False)
+    try:
+        findings = tls_module.run("example.com")
+    finally:
+        http.set_tls_verification(True)
+    assert seen == [ssl.CERT_NONE]
+    assert findings == []
 
 
 def test_hostname_mismatch_and_self_signed_are_info():

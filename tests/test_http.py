@@ -25,6 +25,7 @@ class FakeResponse:
 @pytest.fixture(autouse=True)
 def clean_cache(monkeypatch):
     http.clear_scheme_cache()
+    http.set_tls_verification(True)
     # Real-socket tests pin to a vetted address. A proxy in the environment
     # would skip that pin and send the request somewhere else.
     for name in (
@@ -42,6 +43,7 @@ def clean_cache(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     yield
     http.clear_scheme_cache()
+    http.set_tls_verification(True)
 
 
 def test_get_for_host_prefers_https(monkeypatch):
@@ -896,20 +898,61 @@ def test_tls_protocol_mismatch_still_falls_back_to_http(monkeypatch):
 
 
 def _mint_hostname_cert(directory: Path, hostname: str) -> tuple[Path, Path, Path]:
-    """CA plus a server cert whose SAN is ``hostname``. Returns (ca, cert, key)."""
+    """CA plus a server cert whose SAN is ``hostname``. Returns (ca, cert, key).
+
+    The CA carries ``basicConstraints=critical,CA:TRUE`` and
+    ``keyUsage=critical,keyCertSign,cRLSign``. The leaf carries a SAN and
+    ``serverAuth``. Python 3.13 verifies with ``VERIFY_X509_STRICT`` by
+    default and rejects a bare self-signed certificate used as its own CA
+    ("CA cert does not include key usage extension").
+    """
     openssl = shutil.which("openssl")
     if openssl is None:
         pytest.skip("openssl is required to mint a certificate")
     ca_key = directory / "ca.key"
     ca_cert = directory / "ca.pem"
+    ca_conf = directory / "ca.cnf"
     srv_key = directory / "srv.key"
     csr = directory / "srv.csr"
     cert = directory / "srv.pem"
+    leaf_conf = directory / "leaf.cnf"
+    ca_conf.write_text(
+        "\n".join(
+            [
+                "[req]",
+                "distinguished_name = dn",
+                "x509_extensions = v3_ca",
+                "prompt = no",
+                "[dn]",
+                "CN = Gambit Test CA",
+                "[v3_ca]",
+                "basicConstraints = critical,CA:TRUE",
+                "keyUsage = critical,keyCertSign,cRLSign",
+                "subjectKeyIdentifier = hash",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    leaf_conf.write_text(
+        "\n".join(
+            [
+                "[v3_leaf]",
+                "basicConstraints = CA:FALSE",
+                "keyUsage = critical,digitalSignature,keyEncipherment",
+                "extendedKeyUsage = serverAuth",
+                f"subjectAltName = DNS:{hostname}",
+                "authorityKeyIdentifier = keyid,issuer",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     subprocess.run(
         [
             openssl, "req", "-x509", "-newkey", "rsa:2048",
             "-keyout", str(ca_key), "-out", str(ca_cert),
-            "-days", "1", "-nodes", "-subj", "/CN=Gambit Test CA",
+            "-days", "1", "-nodes", "-config", str(ca_conf),
         ],
         check=True, capture_output=True, cwd=directory,
     )
@@ -918,7 +961,6 @@ def _mint_hostname_cert(directory: Path, hostname: str) -> tuple[Path, Path, Pat
             openssl, "req", "-newkey", "rsa:2048",
             "-keyout", str(srv_key), "-out", str(csr),
             "-nodes", "-subj", f"/CN={hostname}",
-            "-addext", f"subjectAltName=DNS:{hostname}",
         ],
         check=True, capture_output=True, cwd=directory,
     )
@@ -927,7 +969,7 @@ def _mint_hostname_cert(directory: Path, hostname: str) -> tuple[Path, Path, Pat
             openssl, "x509", "-req", "-in", str(csr),
             "-CA", str(ca_cert), "-CAkey", str(ca_key),
             "-CAcreateserial", "-out", str(cert),
-            "-days", "1", "-copy_extensions", "copy",
+            "-days", "1", "-extfile", str(leaf_conf), "-extensions", "v3_leaf",
         ],
         check=True, capture_output=True, cwd=directory,
     )
@@ -994,5 +1036,143 @@ def test_pinned_https_honours_requests_ca_bundle_and_rejects_hostname_mismatch(m
             with pytest.raises(requests.exceptions.SSLError):
                 http.get(f"https://pinned.gambit.test:{port}/", timeout=2)
         finally:
+            server.shutdown()
+            server.server_close()
+
+
+class _VerifyCapturingSession:
+    """Stand-in for ``requests.Session`` that records ``verify`` and URLs."""
+
+    def __init__(self, attempts, https_error=None):
+        self.trust_env = True
+        self._attempts = attempts
+        self._https_error = https_error
+
+    def mount(self, prefix, adapter):
+        return None
+
+    def request(self, method, url, **kwargs):
+        self._attempts.append((url, kwargs.get("verify", "missing")))
+        if url.startswith("https://") and self._https_error is not None:
+            raise self._https_error
+
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, url):
+                self.url = url
+
+            def close(self):
+                return None
+
+            def iter_content(self, chunk_size=8192):
+                yield b"ok"
+
+        return Response(url)
+
+    def close(self):
+        return None
+
+
+def test_insecure_sends_verify_false_and_ignores_the_env_bundle(monkeypatch):
+    attempts = []
+
+    def session_factory():
+        return _VerifyCapturingSession(attempts)
+
+    monkeypatch.setattr(http.requests, "Session", session_factory)
+    monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["93.184.216.34"])
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/tmp/gambit-test-ca.pem")
+    http.set_tls_verification(False)
+    try:
+        http.get("https://example.com/")
+        assert attempts[-1] == ("https://example.com/", False)
+
+        http.get("https://example.com/", verify="/explicit.pem")
+        assert attempts[-1][1] == "/explicit.pem"
+
+        http.get("https://example.com/", verify=True)
+        assert attempts[-1][1] == "/tmp/gambit-test-ca.pem"
+    finally:
+        http.set_tls_verification(True)
+
+
+def test_insecure_does_not_downgrade_a_verification_failure(monkeypatch):
+    attempts = []
+    error = requests.exceptions.SSLError(
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate"
+    )
+
+    def session_factory():
+        return _VerifyCapturingSession(attempts, https_error=error)
+
+    monkeypatch.setattr(http.requests, "Session", session_factory)
+    monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["93.184.216.34"])
+    http.set_tls_verification(False)
+    try:
+        with pytest.raises(requests.exceptions.SSLError, match="not retrying over HTTP"):
+            http.get_for_host("internal.example")
+    finally:
+        http.set_tls_verification(True)
+    assert [url for url, _verify in attempts] == ["https://internal.example/"]
+    assert attempts[0][1] is False
+    assert http.preferred_scheme("internal.example") is None
+
+
+def test_insecure_protocol_mismatch_still_falls_back_to_http(monkeypatch):
+    attempts = []
+    error = requests.exceptions.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number")
+
+    def session_factory():
+        return _VerifyCapturingSession(attempts, https_error=error)
+
+    monkeypatch.setattr(http.requests, "Session", session_factory)
+    monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["93.184.216.34"])
+    http.set_tls_verification(False)
+    try:
+        response = http.get_for_host("plain.example")
+    finally:
+        http.set_tls_verification(True)
+    assert response.url == "http://plain.example/"
+    assert [url for url, _verify in attempts] == [
+        "https://plain.example/",
+        "http://plain.example/",
+    ]
+    assert attempts[0][1] is False
+    assert http.preferred_scheme("plain.example") == "http"
+
+
+def test_insecure_accepts_untrusted_and_mismatched_certs_over_https(monkeypatch):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is required to mint a certificate")
+    with tempfile.TemporaryDirectory() as tmp:
+        _ca, cert, key = _mint_hostname_cert(Path(tmp), "pinned.gambit.test")
+        server = _CountingServer(("127.0.0.1", 0), _RecordingHandler)
+        server.routes = {"/": (200, {}, b"untrusted")}
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        monkeypatch.setattr(http, "resolve_ips", lambda host, timeout: ["127.0.0.1"])
+        http.set_tls_verification(False)
+        try:
+            response = http.get_for_host(f"pinned.gambit.test:{port}", timeout=2)
+            assert response.status_code == 200
+            assert response.content == b"untrusted"
+            assert response.url.startswith("https://")
+            assert _wait_until(lambda: server.accepts >= 1)
+            assert server.accepts == 1
+
+            mismatched = http.get_for_host(f"wrong.gambit.test:{port}", timeout=2)
+            assert mismatched.status_code == 200
+            assert mismatched.url.startswith("https://")
+            assert _wait_until(lambda: server.accepts >= 2)
+            # Still one handshake per host. Plain HTTP is not tried.
+            assert server.accepts == 2
+        finally:
+            http.set_tls_verification(True)
             server.shutdown()
             server.server_close()

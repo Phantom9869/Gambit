@@ -6,15 +6,30 @@ starts the connect timer, so a stuck resolver can hang a scan forever.
 NSS apply) inside a daemon thread and stops waiting at ``timeout``. One
 lookup covers both address families; the deadline is not spent twice.
 
-A lookup that outruns the deadline is abandoned. The thread keeps running
-until the libc call returns — Python cannot cancel ``getaddrinfo`` — but
-the scan does not wait for it, and the thread is a daemon so it will not
-hold the process open.
+A lookup that outruns the deadline is abandoned. Python cannot cancel
+``getaddrinfo``, so the thread keeps running until libc returns, but the
+scan does not wait for it. At most :data:`MAX_RESOLVER_THREADS` of those
+threads exist at once: a further lookup waits for a free slot only until
+its own deadline, then returns ``[]`` instead of starting another thread.
+Completed lookups are remembered until :func:`clear_resolution_cache`, so
+one scan does not resolve the same host again. The threads are daemons
+and do not hold the process open.
 """
 
 import ipaddress
 import socket
 import threading
+import time
+
+# Hung getaddrinfo calls cannot be cancelled. Cap how many may sit in
+# libc at once so a scan of many dead names cannot spawn one thread each.
+MAX_RESOLVER_THREADS = 4
+
+_slots = threading.BoundedSemaphore(MAX_RESOLVER_THREADS)
+_state_lock = threading.Lock()
+_cache: dict[str, tuple[str, ...]] = {}
+_pending: dict[str, threading.Event] = {}
+_generation = 0
 
 
 def is_ip_address(hostname: str) -> bool:
@@ -40,6 +55,19 @@ def is_public_ip(ip: str) -> bool:
     return bool(getattr(addr, "is_global", False))
 
 
+def clear_resolution_cache() -> None:
+    """Forget cached DNS answers so the next scan resolves names again.
+
+    A lookup already blocked in ``getaddrinfo`` keeps its slot until libc
+    returns. If this is called first, that late answer is not cached.
+    """
+    global _generation
+    with _state_lock:
+        _generation += 1
+        _cache.clear()
+        _pending.clear()
+
+
 def resolve_ips(hostname: str, timeout: float) -> list[str]:
     """Resolve ``hostname`` to IP strings within ``timeout`` seconds.
 
@@ -48,6 +76,12 @@ def resolve_ips(hostname: str, timeout: float) -> list[str]:
     hosts-file and NSS answers are visible. Failures, an empty answer,
     and a lookup that exceeds ``timeout`` all yield ``[]``; they never
     raise. The whole lookup shares one deadline.
+
+    A finished lookup is reused for the rest of the process until
+    :func:`clear_resolution_cache`. The same host never occupies more
+    than one resolver thread. When every slot is already taken by a hung
+    lookup, this waits only until ``timeout`` and then returns ``[]``
+    without starting another thread.
     """
     if is_ip_address(hostname):
         return [hostname]
@@ -60,20 +94,77 @@ def resolve_ips(hostname: str, timeout: float) -> list[str]:
     if budget <= 0:
         return []
 
-    box: dict = {}
+    name = str(hostname).strip()
+    key = name.lower()
+    deadline = time.monotonic() + budget
+
+    with _state_lock:
+        cached = _cache.get(key)
+        if cached is not None:
+            return list(cached)
+        event = _pending.get(key)
+        generation = _generation
+        if event is None:
+            event = threading.Event()
+            _pending[key] = event
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        return _wait_for_resolution(key, event, deadline)
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not _slots.acquire(timeout=remaining):
+        _abandon_resolution(key, event, generation)
+        return []
 
     def worker() -> None:
+        ips: tuple[str, ...] = ()
         try:
-            box["ips"] = _resolve_system(hostname)
-        except Exception as exc:
-            box["error"] = exc
+            ips = tuple(_resolve_system(name))
+        except Exception:
+            ips = ()
+        finally:
+            try:
+                with _state_lock:
+                    if _generation == generation and _pending.get(key) is event:
+                        _cache[key] = ips
+                        _pending.pop(key, None)
+                event.set()
+            finally:
+                _slots.release()
 
     thread = threading.Thread(target=worker, name="gambit-resolve", daemon=True)
-    thread.start()
-    thread.join(budget)
-    if thread.is_alive() or "ips" not in box:
+    try:
+        thread.start()
+    except Exception:
+        _slots.release()
+        _abandon_resolution(key, event, generation)
+        raise
+    return _wait_for_resolution(key, event, deadline)
+
+
+def _abandon_resolution(key: str, event: threading.Event, generation: int) -> None:
+    """Drop a lookup that never started so later calls can try again."""
+    with _state_lock:
+        if _generation == generation and _pending.get(key) is event:
+            _pending.pop(key, None)
+    event.set()
+
+
+def _wait_for_resolution(
+    key: str, event: threading.Event, deadline: float
+) -> list[str]:
+    """Wait until ``deadline`` for ``key`` to land in the cache."""
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        event.wait(remaining)
+    with _state_lock:
+        cached = _cache.get(key)
+    if cached is None:
         return []
-    return list(box["ips"])
+    return list(cached)
 
 
 def _resolve_system(hostname: str) -> list[str]:
@@ -130,4 +221,11 @@ def connect(
     raise last
 
 
-__all__ = ["connect", "is_ip_address", "is_public_ip", "resolve_ips"]
+__all__ = [
+    "MAX_RESOLVER_THREADS",
+    "clear_resolution_cache",
+    "connect",
+    "is_ip_address",
+    "is_public_ip",
+    "resolve_ips",
+]

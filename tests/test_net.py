@@ -1,9 +1,23 @@
 import socket
+import threading
 import time
 
 import pytest
 
-from gambit.net import connect, is_public_ip, resolve_ips
+from gambit.net import (
+    MAX_RESOLVER_THREADS,
+    clear_resolution_cache,
+    connect,
+    is_public_ip,
+    resolve_ips,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_dns_cache():
+    clear_resolution_cache()
+    yield
+    clear_resolution_cache()
 
 
 def test_public_address_check_rejects_metadata_and_private_ranges():
@@ -116,6 +130,81 @@ def test_connect_uses_supplied_addresses_without_resolving(monkeypatch):
     assert seen == [(("203.0.113.5", 80), 1.5)]
     with pytest.raises(OSError):
         connect("example.com", 80, 1.5, resolved=[])
+
+
+def test_resolve_ips_reuses_a_finished_lookup(monkeypatch):
+    calls = []
+
+    def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        calls.append(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.9", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    assert resolve_ips("Cache.Example", 1) == ["203.0.113.9"]
+    assert resolve_ips("cache.example", 1) == ["203.0.113.9"]
+    assert calls == ["Cache.Example"]
+    clear_resolution_cache()
+    assert resolve_ips("cache.example", 1) == ["203.0.113.9"]
+    assert calls == ["Cache.Example", "cache.example"]
+
+
+def test_hanging_resolver_across_many_hosts_does_not_grow_threads(monkeypatch):
+    release = threading.Event()
+    entered = []
+    entered_lock = threading.Lock()
+
+    def hang(host, port, family=0, type=0, proto=0, flags=0):
+        with entered_lock:
+            entered.append(host)
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(socket, "getaddrinfo", hang)
+    before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("gambit-resolve")
+    }
+    hosts = [f"hung-{index}.example" for index in range(MAX_RESOLVER_THREADS + 20)]
+    errors = []
+
+    def lookup(host):
+        try:
+            if resolve_ips(host, 0.4) != []:
+                errors.append(host)
+        except Exception as exc:  # the resolver must not raise
+            errors.append(repr(exc))
+
+    callers = [threading.Thread(target=lookup, args=(host,)) for host in hosts]
+    try:
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(3)
+        assert errors == []
+        assert all(not caller.is_alive() for caller in callers)
+        alive = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("gambit-resolve")
+            and thread.is_alive()
+            and thread.ident not in before
+        ]
+        assert len(hosts) > MAX_RESOLVER_THREADS
+        assert 1 <= len(entered) <= MAX_RESOLVER_THREADS
+        assert len(alive) <= MAX_RESOLVER_THREADS
+        # A host that is already hung must not start a second lookup.
+        hung_host = entered[0]
+        with entered_lock:
+            before_count = entered.count(hung_host)
+        assert resolve_ips(hung_host, 0.1) == []
+        with entered_lock:
+            assert entered.count(hung_host) == before_count
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name.startswith("gambit-resolve") and thread.ident not in before:
+                thread.join(2)
 
 
 def test_connect_refuses_a_port_that_would_wrap(monkeypatch):

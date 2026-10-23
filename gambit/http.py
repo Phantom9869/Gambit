@@ -37,9 +37,14 @@ redirects. The pinned session does not trust the environment for
 proxies (that would undo the pin) but still honours
 ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE`` when the caller did not pass
 ``verify=False`` or an explicit bundle path. A TLS *verification*
-failure is not retried over plain HTTP.
-A lookup that outruns its deadline leaves a daemon thread blocked in
-``getaddrinfo`` until the libc call returns; the scan does not wait.
+failure is not retried over plain HTTP. :func:`set_tls_verification`
+can turn verification off for a scan (the ``--insecure`` flag). That
+still speaks HTTPS; it does not downgrade a certificate failure to
+plain HTTP.
+
+DNS lookups are bounded, cached for the scan, and capped at a few
+in-flight resolver threads. One that outruns its deadline does not
+block the scan; see :mod:`gambit.net`.
 
 Response bodies are streamed and capped at :data:`MAX_BODY` bytes unless
 the caller is reading the stream itself.
@@ -49,12 +54,14 @@ import ipaddress
 import os
 import socket
 import ssl
+import warnings
 from typing import NamedTuple
 from urllib.parse import urljoin
 
 import requests
 import urllib3.connection
 import urllib3.exceptions
+from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util.url import parse_url
 
 from gambit.net import is_ip_address, is_public_ip, resolve_ips
@@ -78,6 +85,30 @@ MAX_BODY = 1_048_576  # bytes buffered from a response that the caller does not 
 _SCHEME_BY_HOST: dict[str, str] = {}
 # host -> non-default TCP port discovered by the liveness pre-flight
 _PORT_BY_HOST: dict[str, int] = {}
+# Safer default: verify certificates unless the operator opts out.
+_tls_verification_enabled = True
+
+
+def tls_verification_enabled() -> bool:
+    """True when HTTPS fetches still check certificates."""
+    return _tls_verification_enabled
+
+
+def set_tls_verification(enabled: bool) -> None:
+    """Turn TLS certificate verification on or off for later fetches.
+
+    Off is the ``--insecure`` opt-in. Hostname and chain checks are
+    skipped (``verify=False``) when a caller did not pass ``verify``
+    itself. A certificate failure is still not retried over plain HTTP.
+    """
+    global _tls_verification_enabled
+    _tls_verification_enabled = bool(enabled)
+    # requests warns once per unverified call. The CLI surfaces one note
+    # instead of a warning per host.
+    warnings.simplefilter(
+        "default" if _tls_verification_enabled else "ignore",
+        InsecureRequestWarning,
+    )
 
 
 def request(
@@ -179,7 +210,7 @@ def request(
                     current,
                     headers=merged,
                     timeout=timeout,
-                    **kwargs,
+                    **_apply_tls_verification(kwargs),
                 )
                 send_url = current
         except requests.RequestException:
@@ -318,7 +349,10 @@ def _request_for_host(method: str, target: str, path: str = "", **kwargs):
     as-is. A TLS certificate verification failure is not a dead port:
     it is re-raised, and plain HTTP is not tried. That keeps an internal
     CA problem (or a hostname mismatch) from being silently downgraded.
-    Raises the last exception if every scheme fails.
+    With verification disabled (:func:`set_tls_verification`), those
+    certificates are accepted on HTTPS instead, and plain HTTP is still
+    not used as a substitute. Raises the last exception if every scheme
+    fails.
     """
     if path and not path.startswith("/"):
         path = "/" + path
@@ -503,15 +537,30 @@ def _is_tls_verify_failure(exc: BaseException) -> bool:
     return False
 
 
+def _apply_tls_verification(kwargs: dict) -> dict:
+    """Copy ``kwargs`` and apply the process verification policy.
+
+    An explicit ``verify`` argument always wins, including ``verify=False``
+    and a bundle path. When the caller left it unset and verification is
+    disabled, certificate checks are turned off.
+    """
+    copied = dict(kwargs)
+    if "verify" not in copied and not _tls_verification_enabled:
+        copied["verify"] = False
+    return copied
+
+
 def _with_env_ca_bundle(kwargs: dict) -> dict:
     """Copy ``kwargs`` and apply ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE``.
 
     The pinned session keeps ``trust_env`` false so an environment proxy
     cannot replace the dialed address. requests reads the CA bundle only
     when ``trust_env`` is true, so copy it into ``verify`` here.
-    ``verify=False`` and an explicit bundle path are left alone.
+    ``verify=False`` and an explicit bundle path are left alone. With
+    verification disabled and no explicit ``verify``, the result is
+    ``verify=False`` and the environment bundle is not consulted.
     """
-    copied = dict(kwargs)
+    copied = _apply_tls_verification(kwargs)
     copied.pop("proxies", None)
     if "verify" not in copied:
         verify = True
@@ -867,5 +916,7 @@ __all__ = [
     "request",
     "set_preferred_port",
     "set_preferred_scheme",
+    "set_tls_verification",
+    "tls_verification_enabled",
     "url_authority",
 ]

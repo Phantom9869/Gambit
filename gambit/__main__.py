@@ -11,6 +11,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from gambit.http import set_tls_verification
+from gambit.models import Finding, Severity
 from gambit.modules import (
     baseline_headers,
     cors,
@@ -22,6 +24,7 @@ from gambit.modules import (
     takeover,
     tls,
 )
+from gambit.net import clear_resolution_cache
 from gambit.pipeline import (
     DEFAULT_MAX_HOSTS,
     discover_hosts,
@@ -30,6 +33,12 @@ from gambit.pipeline import (
     run_pipeline,
 )
 from gambit.triage import to_json, to_markdown, to_text
+
+INSECURE_NOTE = (
+    "NOTE: TLS certificate verification was disabled (--insecure). "
+    "HTTPS requests accepted untrusted certificates and were not retried "
+    "over plain HTTP."
+)
 
 # Run once on the apex target, in this order.
 APEX_MODULES = [gather]
@@ -77,16 +86,47 @@ def _positive_int(value: str) -> int:
     return number
 
 
-def format_report(findings, report_format: str) -> str:
-    """Render ``findings`` as ``text``, ``md``, or ``json`` (ranked)."""
+def verification_disabled_finding(host: str) -> Finding:
+    """INFO finding recorded when the operator passed ``--insecure``."""
+    return Finding(
+        severity=Severity.INFO,
+        host=host,
+        title="TLS certificate verification disabled",
+        evidence=(
+            "--insecure: HTTPS fetches and the TLS handshake did not verify "
+            "certificates. A certificate failure was not retried over plain HTTP."
+        ),
+        why=(
+            "Self-signed and untrusted certificates are common on pentest "
+            "targets. With verification off, those sites can still be checked, "
+            "but a network attacker could present a different certificate."
+        ),
+        next_step="Re-run without --insecure when the target uses a certificate you trust.",
+    )
+
+
+def format_report(findings, report_format: str, *, insecure: bool = False) -> str:
+    """Render ``findings`` as ``text``, ``md``, or ``json`` (ranked).
+
+    ``insecure=True`` puts a one-line note at the top of text and Markdown
+    reports. JSON keeps a pure list; the matching INFO finding carries
+    the same fact there.
+    """
     try:
         formatter = _FORMATTERS[report_format]
     except KeyError:
         raise ValueError(f"unknown report format: {report_format!r}") from None
-    return formatter(findings)
+    body = formatter(findings)
+    if not insecure or report_format == "json":
+        return body
+    if report_format == "md":
+        return f"> {INSECURE_NOTE}\n\n{body}"
+    return f"{INSECURE_NOTE}\n\n{body}"
 
 
-def collect_findings(target: str, max_hosts: int = DEFAULT_MAX_HOSTS) -> list:
+def collect_findings(
+    target: str, max_hosts: int = DEFAULT_MAX_HOSTS, *, insecure: bool = False
+) -> list:
     """Run the full pipeline for ``target`` and return all findings.
 
     Gather runs once on the apex; host discovery uses Gather's crt.sh
@@ -95,8 +135,16 @@ def collect_findings(target: str, max_hosts: int = DEFAULT_MAX_HOSTS) -> list:
     then run against the discovered (deduped, capped) hosts that pass a
     cheap liveness pre-flight. Per-module failures are isolated by the
     pipeline helpers, so one failing check never aborts the scan.
+
+    ``insecure=True`` disables TLS certificate verification for the scan
+    (HTTPS is still used) and records that choice as an INFO finding.
+    DNS answers cached by an earlier scan are dropped first.
     """
+    set_tls_verification(not insecure)
+    clear_resolution_cache()
     findings = []
+    if insecure:
+        findings.append(verification_disabled_finding(target))
     findings.extend(run_for_host(target, APEX_MODULES))
 
     hosts = discover_hosts(
@@ -159,6 +207,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="confirm you own the target or have written permission to test it",
     )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help=(
+            "disable TLS certificate verification for HTTPS requests and the "
+            "TLS handshake (self-signed certificates and hostname mismatches "
+            "are accepted). Off by default. Does not fall back to plain HTTP. "
+            "The report notes that verification was disabled."
+        ),
+    )
     return parser
 
 
@@ -174,10 +232,15 @@ def main(argv=None) -> int:
             print("Aborting: authorization not confirmed.", file=sys.stderr)
             return 1
 
-    findings = collect_findings(args.target, max_hosts=args.max_hosts)
+    if args.insecure:
+        print(INSECURE_NOTE, file=sys.stderr)
+
+    findings = collect_findings(
+        args.target, max_hosts=args.max_hosts, insecure=args.insecure
+    )
 
     report_format = "json" if args.json else args.format
-    report = format_report(findings, report_format)
+    report = format_report(findings, report_format, insecure=args.insecure)
 
     if args.output:
         try:

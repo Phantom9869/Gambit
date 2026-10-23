@@ -52,6 +52,8 @@ python -m gambit example.com
 
 GAMBIT first runs Gather for the target, then runs the per-host checks (takeover, Analyze, Baseline, Inspect, and Map) on the apex host and the subdomains it discovers, and finally ranks everything with Triage. Discovered hosts are de-duplicated and capped (25 by default; see `--max-hosts`) so a scan stays small. Each host first gets a cheap connection pre-flight, so a dead subdomain costs a second instead of stacking every check's timeout; hosts are then checked one at a time with a short pause between them. Web checks try HTTPS first and fall back to plain HTTP, so HTTP-only sites are still checked.
 
+Certificate verification stays on unless you pass `--insecure`. A certificate problem (self-signed, untrusted CA, hostname mismatch) is reported and is **not** retried over plain HTTP, so a scan cannot silently downgrade. `--insecure` accepts those certificates and keeps speaking HTTPS. GAMBIT prints a warning and records the choice in the report. Use it for lab targets and appliances that ship a private certificate, and leave it off when you want the client's trust store to apply.
+
 | Flag | Description |
 |---|---|
 | `--format text\|md\|json` | Report format: human-readable text (default), Markdown (`md`), or JSON (`json`). |
@@ -59,6 +61,7 @@ GAMBIT first runs Gather for the target, then runs the per-host checks (takeover
 | `-o FILE`, `--output FILE` | Write the report to `FILE` instead of standard output. |
 | `--max-hosts N` | Maximum number of hosts to check, including the target itself (default: 25). |
 | `--yes` | Skip the interactive authorization confirmation (see [Responsible use](#responsible-use)). Use only where you already have permission. |
+| `--insecure` | Disable TLS certificate verification for HTTPS requests and the TLS handshake. Self-signed certificates and hostname mismatches are accepted. Off by default. Does not fall back to plain HTTP. The report notes that verification was disabled. |
 
 For example, to save a Markdown report for at most 10 hosts without the confirmation prompt:
 
@@ -146,7 +149,7 @@ Adding a check means adding one file. The Triage stage sorts every finding from 
 - [x] **Map:** common-port check
 - [x] **Triage:** severity ranking and Markdown/JSON export
 - [x] Tests for every module
-- [x] CI (pytest on Ubuntu and Windows, Python 3.11 and 3.12)
+- [x] CI (pytest on Ubuntu and Windows, Python 3.11, 3.12, and 3.13)
 - [ ] First tagged release
 
 ## Prior art

@@ -203,7 +203,7 @@ def host_reachable(host: str, *, timeout: float = 1.0) -> bool:
     even for hosts that answer on no web port.
     """
     from gambit.http import set_preferred_port, set_preferred_scheme
-    from gambit.net import connect
+    from gambit.net import ResolverSaturated, connect
 
     if port_out_of_range(host):
         return False
@@ -217,6 +217,11 @@ def host_reachable(host: str, *, timeout: float = 1.0) -> bool:
         try:
             with connect(name, port, timeout):
                 pass
+        except ResolverSaturated:
+            # Not "offline". The caller reports the saturated pool.
+            # Do not try the remaining ports: each one would wait out
+            # the same deadline for a resolver slot.
+            raise
         except OSError:
             continue
         if explicit_port is None:
@@ -226,6 +231,30 @@ def host_reachable(host: str, *, timeout: float = 1.0) -> bool:
             set_preferred_port(host, None if port in (443, 80) else port)
         return True
     return False
+
+
+def resolver_saturated_finding(host: str, detail: str = "") -> Finding:
+    """INFO finding for a lookup skipped because the resolver pool was full.
+
+    This is not a negative cache and not "the name does not resolve".
+    """
+    evidence = (
+        "Every resolver thread was busy in getaddrinfo, so this host was "
+        "not looked up. The skip was not cached."
+    )
+    if detail:
+        evidence = f"{evidence} ({detail})"
+    return Finding(
+        severity=Severity.INFO,
+        host=host,
+        title="DNS resolver saturated",
+        evidence=evidence,
+        why=(
+            "A hung lookup is still occupying the resolver. This is not "
+            "the same as a name that does not resolve."
+        ),
+        next_step="Re-run the scan. If it persists, a hostname lookup is hanging.",
+    )
 
 
 def dedupe_hosts(
@@ -360,6 +389,9 @@ def run_pipeline(
     it rejects gets a single INFO "Host did not respond" finding and its
     modules are skipped, so one dead host cannot stack every module's
     full timeout. (:func:`host_reachable` is the production preflight.)
+    :class:`gambit.net.ResolverSaturated` from the preflight is reported
+    as "DNS resolver saturated" instead, so a full resolver pool is not
+    described as an offline host.
 
     Findings are returned in host-then-module order; ranking for display
     stays Triage's job (``gambit.triage.rank``).
@@ -371,25 +403,33 @@ def run_pipeline(
             target, extra_hosts, discover=discover, max_hosts=max_hosts
         )
 
+    from gambit.net import ResolverSaturated
+
     findings: list[Finding] = []
     for index, host in enumerate(resolved):
         if index and delay:
             sleep(delay)
-        if preflight is not None and not preflight(host):
-            findings.append(
-                Finding(
-                    severity=Severity.INFO,
-                    host=host,
-                    title="Host did not respond to a connection attempt",
-                    evidence="TCP connection to the host failed or timed out "
-                    "on the checked ports (pre-flight)",
-                    why="The host may be offline, filtered, or no longer "
-                    "in service, so the per-host checks were skipped.",
-                    next_step="Confirm the host is still in use; if it is "
-                    "a stale subdomain, consider removing its DNS records.",
+        if preflight is not None:
+            try:
+                reachable = preflight(host)
+            except ResolverSaturated as exc:
+                findings.append(resolver_saturated_finding(host, str(exc)))
+                continue
+            if not reachable:
+                findings.append(
+                    Finding(
+                        severity=Severity.INFO,
+                        host=host,
+                        title="Host did not respond to a connection attempt",
+                        evidence="TCP connection to the host failed or timed out "
+                        "on the checked ports (pre-flight)",
+                        why="The host may be offline, filtered, or no longer "
+                        "in service, so the per-host checks were skipped.",
+                        next_step="Confirm the host is still in use; if it is "
+                        "a stale subdomain, consider removing its DNS records.",
+                    )
                 )
-            )
-            continue
+                continue
         findings.extend(run_for_host(host, modules))
     return findings
 
@@ -405,6 +445,7 @@ __all__ = [
     "host_reachable",
     "normalize_host",
     "port_out_of_range",
+    "resolver_saturated_finding",
     "run_for_host",
     "run_modules_for_host",
     "run_pipeline",

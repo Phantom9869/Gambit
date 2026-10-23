@@ -114,8 +114,8 @@ def run(target: str) -> list[Finding]:
     outside 1–65535 is not probed: the platform resolver would otherwise
     truncate it into a different port.
     """
-    from gambit.net import connect, resolve_ips
-    from gambit.pipeline import split_host_port
+    from gambit.net import connect, resolution_saturated, resolve_ips
+    from gambit.pipeline import resolver_saturated_finding, split_host_port
 
     hostname, explicit_port = split_host_port(target)
     host = hostname or target
@@ -124,6 +124,8 @@ def run(target: str) -> list[Finding]:
         ports.append(explicit_port)
     ips = resolve_ips(host, TIMEOUT)
     if not ips:
+        if resolution_saturated(host):
+            return [resolver_saturated_finding(host)]
         return []
     findings = []
     for port in ports:

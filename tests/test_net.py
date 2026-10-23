@@ -4,11 +4,15 @@ import time
 
 import pytest
 
+import logging
+
 from gambit.net import (
     MAX_RESOLVER_THREADS,
+    ResolverSaturated,
     clear_resolution_cache,
     connect,
     is_public_ip,
+    resolution_saturated,
     resolve_ips,
 )
 
@@ -205,6 +209,102 @@ def test_hanging_resolver_across_many_hosts_does_not_grow_threads(monkeypatch):
         for thread in threading.enumerate():
             if thread.name.startswith("gambit-resolve") and thread.ident not in before:
                 thread.join(2)
+
+
+def test_transient_resolver_failure_is_not_cached(monkeypatch):
+    calls = []
+
+    def flaky(host, port, family=0, type=0, proto=0, flags=0):
+        calls.append(host)
+        if len(calls) == 1:
+            raise socket.gaierror(socket.EAI_AGAIN, "temporary failure in name resolution")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.7", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", flaky)
+    assert resolve_ips("flaky.example", 1) == []
+    assert resolution_saturated("flaky.example") is False
+    assert resolve_ips("flaky.example", 1) == ["203.0.113.7"]
+    assert calls == ["flaky.example", "flaky.example"]
+
+
+def test_saturated_resolver_is_signalled_and_not_cached(monkeypatch, caplog):
+    release = threading.Event()
+
+    def hang(host, port, family=0, type=0, proto=0, flags=0):
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(socket, "getaddrinfo", hang)
+    holders = [
+        threading.Thread(target=resolve_ips, args=(f"hold-{index}.example", 0.05))
+        for index in range(MAX_RESOLVER_THREADS)
+    ]
+    try:
+        for holder in holders:
+            holder.start()
+        for holder in holders:
+            holder.join(2)
+        assert all(not holder.is_alive() for holder in holders)
+        with caplog.at_level(logging.WARNING, logger="gambit.net"):
+            assert resolve_ips("healthy.example", 0.05) == []
+        assert resolution_saturated("healthy.example") is True
+        assert any("saturated" in record.message.lower() for record in caplog.records)
+        assert any("not cached" in record.message.lower() for record in caplog.records)
+        assert resolve_ips("healthy.example", 0.05) == []
+        assert resolution_saturated("healthy.example") is True
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name.startswith("gambit-resolve"):
+                thread.join(2)
+
+    def answer(host, port, family=0, type=0, proto=0, flags=0):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.8", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", answer)
+    assert resolve_ips("healthy.example", 1) == ["198.51.100.8"]
+    assert resolution_saturated("healthy.example") is False
+    # connect distinguishes a full pool from an unresolvable name.
+    monkeypatch.setattr(socket, "getaddrinfo", hang)
+    release.clear()
+    blockers = [
+        threading.Thread(target=resolve_ips, args=(f"block-{index}.example", 0.05))
+        for index in range(MAX_RESOLVER_THREADS)
+    ]
+    try:
+        for blocker in blockers:
+            blocker.start()
+        for blocker in blockers:
+            blocker.join(2)
+        with pytest.raises(ResolverSaturated):
+            connect("again.example", 80, 0.05)
+        assert resolution_saturated("again.example") is True
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name.startswith("gambit-resolve"):
+                thread.join(2)
+
+
+def test_slow_burst_finishes_inside_one_deadline(monkeypatch):
+    def slow(host, port, family=0, type=0, proto=0, flags=0):
+        time.sleep(0.3)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.10", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow)
+    hosts = [f"slow-{index}.example" for index in range(20)]
+    results: dict[str, list[str]] = {}
+
+    def lookup(host):
+        results[host] = resolve_ips(host, 1.0)
+
+    callers = [threading.Thread(target=lookup, args=(host,)) for host in hosts]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(3)
+    assert all(not caller.is_alive() for caller in callers)
+    assert [results.get(host) for host in hosts] == [["203.0.113.10"]] * len(hosts)
 
 
 def test_connect_refuses_a_port_that_would_wrap(monkeypatch):

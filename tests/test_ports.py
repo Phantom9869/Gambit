@@ -63,6 +63,15 @@ def test_explicit_port_is_probed_and_out_of_range_port_is_not(monkeypatch):
     assert ("example.com", 443, ["203.0.113.1"]) in tried
 
 
+def test_saturated_resolver_is_reported_instead_of_skipped(monkeypatch):
+    monkeypatch.setattr("gambit.net.resolve_ips", lambda host, timeout: [])
+    monkeypatch.setattr("gambit.net.resolution_saturated", lambda host: host == "example.com")
+    findings = run("example.com")
+    assert len(findings) == 1
+    assert findings[0].title == "DNS resolver saturated"
+    assert "not cached" in findings[0].evidence
+
+
 def test_run_resolves_the_host_once(monkeypatch):
     resolved_calls = []
     connect_calls = []

@@ -115,6 +115,33 @@ def test_evaluate_dns_ignores_empty_values():
 # --- crt.sh is queried once per host per process -------------------------
 
 
+def test_crtsh_request_keeps_verification_when_insecure(monkeypatch):
+    import gambit.http as http
+
+    gather.clear_crtsh_cache()
+    seen = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return []
+
+    def fake_get(url, **kwargs):
+        seen.append(kwargs.get("verify", "missing"))
+        return FakeResponse()
+
+    monkeypatch.setattr(gather, "get", fake_get)
+    http.set_tls_verification(False)
+    try:
+        assert gather.discover_subdomains("example.com") == []
+    finally:
+        http.set_tls_verification(True)
+        gather.clear_crtsh_cache()
+    assert seen == [True]
+
+
 def test_crtsh_fetch_is_cached_between_run_and_discovery(monkeypatch):
     gather.clear_crtsh_cache()
     calls = []

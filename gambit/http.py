@@ -64,7 +64,7 @@ import urllib3.exceptions
 from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util.url import parse_url
 
-from gambit.net import is_ip_address, is_public_ip, resolve_ips
+from gambit.net import is_ip_address, is_public_ip, resolution_saturated, resolve_ips
 
 # Identity of the real requests entry point. Tests replace
 # ``gambit.http.requests.request``; when they have, pinning is skipped
@@ -87,6 +87,8 @@ _SCHEME_BY_HOST: dict[str, str] = {}
 _PORT_BY_HOST: dict[str, int] = {}
 # Safer default: verify certificates unless the operator opts out.
 _tls_verification_enabled = True
+# The warnings filter installed while verification is off, if any.
+_active_warning_filter: tuple | None = None
 
 
 def tls_verification_enabled() -> bool:
@@ -101,14 +103,25 @@ def set_tls_verification(enabled: bool) -> None:
     skipped (``verify=False``) when a caller did not pass ``verify``
     itself. A certificate failure is still not retried over plain HTTP.
     """
-    global _tls_verification_enabled
-    _tls_verification_enabled = bool(enabled)
+    global _tls_verification_enabled, _active_warning_filter
+    enabled = bool(enabled)
+    _tls_verification_enabled = enabled
     # requests warns once per unverified call. The CLI surfaces one note
-    # instead of a warning per host.
-    warnings.simplefilter(
-        "default" if _tls_verification_enabled else "ignore",
-        InsecureRequestWarning,
-    )
+    # instead. Installing the filter must be idempotent: simplefilter
+    # inserts a new entry on every call.
+    if enabled:
+        if _active_warning_filter is not None:
+            try:
+                warnings.filters.remove(_active_warning_filter)
+            except ValueError:
+                pass
+            _active_warning_filter = None
+        return
+    if _active_warning_filter is not None:
+        return
+    item = ("ignore", None, InsecureRequestWarning, None, 0)
+    warnings.filters.insert(0, item)
+    _active_warning_filter = item
 
 
 def request(
@@ -188,6 +201,11 @@ def request(
                 if pending_ips is None:
                     ips = resolve_ips(_dns_name(target.host), _timeout_seconds(timeout))
                     if not ips:
+                        if resolution_saturated(target.host):
+                            raise requests.ConnectionError(
+                                "DNS resolver saturated; could not resolve "
+                                f"{target.host}"
+                            )
                         raise requests.ConnectionError(
                             f"could not resolve {target.host}"
                         )

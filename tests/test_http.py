@@ -1075,6 +1075,30 @@ class _VerifyCapturingSession:
         return None
 
 
+def test_set_tls_verification_warning_filter_is_idempotent():
+    import warnings
+
+    from urllib3.exceptions import InsecureRequestWarning
+
+    def installed():
+        return [item for item in warnings.filters if item[2] is InsecureRequestWarning]
+
+    http.set_tls_verification(True)
+    before = len(installed())
+    try:
+        for _ in range(5):
+            http.set_tls_verification(False)
+        assert len(installed()) == before + 1
+        for _ in range(5):
+            http.set_tls_verification(False)
+        assert len(installed()) == before + 1
+        for _ in range(5):
+            http.set_tls_verification(True)
+        assert len(installed()) == before
+    finally:
+        http.set_tls_verification(True)
+
+
 def test_insecure_sends_verify_false_and_ignores_the_env_bundle(monkeypatch):
     attempts = []
 

@@ -9,27 +9,44 @@ lookup covers both address families; the deadline is not spent twice.
 A lookup that outruns the deadline is abandoned. Python cannot cancel
 ``getaddrinfo``, so the thread keeps running until libc returns, but the
 scan does not wait for it. At most :data:`MAX_RESOLVER_THREADS` of those
-threads exist at once: a further lookup waits for a free slot only until
-its own deadline, then returns ``[]`` instead of starting another thread.
-Completed lookups are remembered until :func:`clear_resolution_cache`, so
-one scan does not resolve the same host again. The threads are daemons
-and do not hold the process open.
+threads exist at once. A further lookup waits for a free slot only until
+its own deadline, then returns ``[]`` without caching that skip.
+:func:`resolution_saturated` is true for that host until a later call
+actually runs, and a warning is logged, so a full pool is not reported
+as a name that does not resolve. Only a non-empty answer is remembered
+until :func:`clear_resolution_cache`. The threads are daemons and do
+not hold the process open.
 """
 
 import ipaddress
+import logging
 import socket
 import threading
 import time
 
-# Hung getaddrinfo calls cannot be cancelled. Cap how many may sit in
-# libc at once so a scan of many dead names cannot spawn one thread each.
-MAX_RESOLVER_THREADS = 4
+# Hung getaddrinfo calls cannot be cancelled. The cap has to be large
+# enough that a burst of slow-but-healthy lookups still finishes inside
+# one deadline; a handful of hung names must not crowd everyone else out.
+MAX_RESOLVER_THREADS = 16
 
+_log = logging.getLogger("gambit.net")
 _slots = threading.BoundedSemaphore(MAX_RESOLVER_THREADS)
 _state_lock = threading.Lock()
 _cache: dict[str, tuple[str, ...]] = {}
 _pending: dict[str, threading.Event] = {}
+# Hosts whose latest attempt did not run because every slot was busy.
+# This is a signal, not a negative cache: the next call tries again.
+_saturated: set[str] = set()
 _generation = 0
+
+
+class ResolverSaturated(OSError):
+    """The name was not looked up; every resolver thread is still in libc.
+
+    Distinct from an empty answer. Nothing was cached, so the next call
+    tries again. :func:`connect` raises this; :func:`resolve_ips` still
+    returns ``[]`` and never raises.
+    """
 
 
 def is_ip_address(hostname: str) -> bool:
@@ -66,6 +83,7 @@ def clear_resolution_cache() -> None:
         _generation += 1
         _cache.clear()
         _pending.clear()
+        _saturated.clear()
 
 
 def resolve_ips(hostname: str, timeout: float) -> list[str]:
@@ -77,11 +95,13 @@ def resolve_ips(hostname: str, timeout: float) -> list[str]:
     and a lookup that exceeds ``timeout`` all yield ``[]``; they never
     raise. The whole lookup shares one deadline.
 
-    A finished lookup is reused for the rest of the process until
-    :func:`clear_resolution_cache`. The same host never occupies more
-    than one resolver thread. When every slot is already taken by a hung
-    lookup, this waits only until ``timeout`` and then returns ``[]``
-    without starting another thread.
+    A finished lookup that returned at least one address is reused until
+    :func:`clear_resolution_cache`. An empty answer or a resolver error
+    (including a transient ``EAI_AGAIN``) is not cached, so the next call
+    tries again. The same host never occupies more than one resolver
+    thread. When every slot is already taken, this waits only until
+    ``timeout``, logs a warning, marks the host via
+    :func:`resolution_saturated`, and returns ``[]`` without caching.
     """
     if is_ip_address(hostname):
         return [hostname]
@@ -95,7 +115,7 @@ def resolve_ips(hostname: str, timeout: float) -> list[str]:
         return []
 
     name = str(hostname).strip()
-    key = name.lower()
+    key = _resolution_key(name)
     deadline = time.monotonic() + budget
 
     with _state_lock:
@@ -116,8 +136,20 @@ def resolve_ips(hostname: str, timeout: float) -> list[str]:
 
     remaining = deadline - time.monotonic()
     if remaining <= 0 or not _slots.acquire(timeout=remaining):
+        with _state_lock:
+            if _generation == generation:
+                _saturated.add(key)
         _abandon_resolution(key, event, generation)
+        _log.warning(
+            "DNS resolver saturated (%d lookups in flight); skipped %s. "
+            "The skip is not cached.",
+            MAX_RESOLVER_THREADS,
+            name,
+        )
         return []
+
+    with _state_lock:
+        _saturated.discard(key)
 
     def worker() -> None:
         ips: tuple[str, ...] = ()
@@ -129,8 +161,12 @@ def resolve_ips(hostname: str, timeout: float) -> list[str]:
             try:
                 with _state_lock:
                     if _generation == generation and _pending.get(key) is event:
-                        _cache[key] = ips
+                        # Empty and failed answers stay uncached so a
+                        # transient EAI_AGAIN can succeed on the next call.
+                        if ips:
+                            _cache[key] = ips
                         _pending.pop(key, None)
+                        _saturated.discard(key)
                 event.set()
             finally:
                 _slots.release()
@@ -167,6 +203,21 @@ def _wait_for_resolution(
     return list(cached)
 
 
+def _resolution_key(hostname: str) -> str:
+    return str(hostname).strip().lower()
+
+
+def resolution_saturated(hostname: str) -> bool:
+    """True when the latest lookup for ``hostname`` was skipped.
+
+    The pool was full, so no ``getaddrinfo`` ran and nothing was cached.
+    A later :func:`resolve_ips` tries again and clears this once a lookup
+    actually starts. An empty answer from the resolver does not set it.
+    """
+    with _state_lock:
+        return _resolution_key(hostname) in _saturated
+
+
 def _resolve_system(hostname: str) -> list[str]:
     """One ``getaddrinfo`` call: hosts file, then DNS, A and AAAA together."""
     try:
@@ -201,14 +252,19 @@ def connect(
     1–65535 raise ``OSError`` instead of being truncated by the resolver.
     Pass ``resolved`` to dial addresses already looked up (one lookup
     for many ports). ``None`` resolves ``hostname``; an empty list does
-    not, and raises. Raises ``OSError`` when the name does not resolve
-    or every address refuses the connection.
+    not, and raises. Raises :class:`ResolverSaturated` when the lookup
+    was skipped because every resolver thread was busy, and ``OSError``
+    when the name does not resolve or every address refuses the connection.
     """
     number = int(port)
     if number < 1 or number > 65535:
         raise OSError(f"port out of range: {port}")
     ips = list(resolved) if resolved is not None else resolve_ips(hostname, timeout)
     if not ips:
+        if resolved is None and resolution_saturated(hostname):
+            raise ResolverSaturated(
+                f"DNS resolver saturated; could not resolve {hostname}"
+            )
         raise OSError(f"could not resolve {hostname}")
     last: OSError | None = None
     for ip in ips:
@@ -223,9 +279,11 @@ def connect(
 
 __all__ = [
     "MAX_RESOLVER_THREADS",
+    "ResolverSaturated",
     "clear_resolution_cache",
     "connect",
     "is_ip_address",
     "is_public_ip",
+    "resolution_saturated",
     "resolve_ips",
 ]

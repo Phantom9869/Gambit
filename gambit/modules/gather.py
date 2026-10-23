@@ -239,6 +239,9 @@ def _fetch_crtsh_subdomains(host: str) -> list[str]:
             _CRT_SH_URL.format(host=host),
             timeout=TIMEOUT,
             allow_redirects=False,
+            # crt.sh is a third party. --insecure must not turn off
+            # verification for this call.
+            verify=True,
         )
         response.raise_for_status()
         names = parse_crtsh(response.json())

@@ -3,13 +3,12 @@
 Standard library only (``ssl`` + ``socket``). The pure :func:`evaluate`
 function does the date/version maths on a certificate dict like the one
 ``ssl.SSLSocket.getpeercert()`` returns, so tests never need a network.
-``run`` performs a single verified handshake; a certificate that fails
-verification (hostname mismatch, self-signed, ...) is reported as INFO
-evidence rather than a vulnerability claim, and its details are still
-collected over an unverified handshake for the expiry/version checks.
-When the operator disables verification (``--insecure``), that first
-handshake is unverified too: expiry and protocol are still checked, and
-the report notes that verification was skipped.
+``run`` performs a verified handshake first so a failure can be
+classified (hostname mismatch, self-signed, or an untrusted chain) and
+reported as INFO rather than a vulnerability claim. Certificate details
+are then read over an unverified handshake for the expiry and version
+checks. ``--insecure`` skips verification on content fetches only; this
+module still classifies the certificate the same way.
 """
 
 import os
@@ -18,7 +17,7 @@ import tempfile
 from collections.abc import Mapping
 from datetime import date, datetime, time, timezone
 
-from gambit.http import TIMEOUT, USER_AGENT, tls_verification_enabled
+from gambit.http import TIMEOUT, USER_AGENT
 from gambit.models import Finding, Severity
 
 __all__ = [
@@ -381,29 +380,16 @@ def _unverified_context() -> ssl.SSLContext:
 
 
 def run(target: str) -> list[Finding]:
-    """Check the target's TLS certificate and protocol over one handshake.
+    """Check the target's TLS certificate and protocol.
 
-    With certificate verification disabled (``--insecure``), the handshake
-    does not check the chain or hostname. Expiry and protocol findings
-    are still reported. The scan-level note is what records the opt-in;
-    this function does not add another copy per host.
+    The first handshake verifies, including when ``--insecure`` disabled
+    verification for content fetches. That failure is what classifies a
+    hostname mismatch, a self-signed certificate, or an untrusted chain.
+    A second, unverified handshake then supplies expiry and protocol
+    details. The scan-level note still records that content fetches did
+    not verify.
     """
     hostname, port = _split_host_port(target)
-    if not tls_verification_enabled():
-        try:
-            cert, protocol = _handshake(hostname, port, _unverified_context())
-        except (OSError, ssl.SSLError) as exc:
-            return [
-                Finding(
-                    severity=Severity.INFO,
-                    host=target,
-                    title="Could not check TLS",
-                    evidence=str(exc),
-                    why="The TLS check could not run. Certificate verification was already disabled.",
-                    next_step="Check the hostname, and whether the site serves HTTPS on port 443.",
-                )
-            ]
-        return evaluate(target, cert, protocol)
     try:
         cert, protocol = _handshake(hostname, port, ssl.create_default_context())
     except ssl.SSLCertVerificationError as exc:

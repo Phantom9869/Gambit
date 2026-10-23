@@ -158,11 +158,13 @@ def test_handshake_reads_binary_cert_when_getpeercert_returns_empty(monkeypatch)
     assert "2020" in cert["notAfter"]
 
 
-def test_insecure_tls_handshake_does_not_verify(monkeypatch):
+def test_insecure_tls_still_classifies_a_verification_failure(monkeypatch):
     seen = []
 
     def fake_handshake(hostname, port, context):
         seen.append(context.verify_mode)
+        if context.verify_mode != ssl.CERT_NONE:
+            raise ssl.SSLCertVerificationError(1, "self-signed certificate")
         return ({"notAfter": "Dec  1 00:00:00 2099 GMT"}, "TLSv1.3")
 
     monkeypatch.setattr(tls_module, "_handshake", fake_handshake)
@@ -171,8 +173,9 @@ def test_insecure_tls_handshake_does_not_verify(monkeypatch):
         findings = tls_module.run("example.com")
     finally:
         http.set_tls_verification(True)
-    assert seen == [ssl.CERT_NONE]
-    assert findings == []
+    assert seen[0] != ssl.CERT_NONE
+    assert ssl.CERT_NONE in seen
+    assert any("self-signed" in finding.title.lower() for finding in findings)
 
 
 def test_hostname_mismatch_and_self_signed_are_info():

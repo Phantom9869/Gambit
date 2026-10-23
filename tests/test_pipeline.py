@@ -1,3 +1,5 @@
+import pytest
+
 from gambit.models import Finding, Severity
 from gambit.pipeline import dedupe_hosts, discover_hosts, normalize_host, run_for_host, run_pipeline
 
@@ -247,6 +249,38 @@ def test_preflight_open_alt_port_is_used_in_the_url(monkeypatch):
     assert seen[0] == "https://alt.example:8443"
     assert seen[1] == "http://dev.example:8080"
     http.clear_scheme_cache()
+
+
+def test_preflight_saturation_is_not_reported_as_offline():
+    from gambit.net import ResolverSaturated
+
+    def saturated(host):
+        raise ResolverSaturated("DNS resolver saturated; could not resolve " + host)
+
+    findings = run_pipeline(
+        "example.com",
+        [GoodModule()],
+        hosts=["example.com"],
+        delay=0,
+        sleep=lambda s: None,
+        preflight=saturated,
+    )
+    assert len(findings) == 1
+    assert findings[0].title == "DNS resolver saturated"
+    assert "did not respond" not in findings[0].title
+    assert "good:" not in findings[0].title
+
+
+def test_host_reachable_propagates_resolver_saturation(monkeypatch):
+    from gambit.net import ResolverSaturated
+    from gambit.pipeline import host_reachable
+
+    def fake_connect(*args, **kwargs):
+        raise ResolverSaturated("busy")
+
+    monkeypatch.setattr("gambit.net.connect", fake_connect)
+    with pytest.raises(ResolverSaturated):
+        host_reachable("busy.example", timeout=0.1)
 
 
 def test_run_pipeline_preflight_skips_dead_hosts():

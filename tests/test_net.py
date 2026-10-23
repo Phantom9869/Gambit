@@ -17,11 +17,37 @@ from gambit.net import (
 )
 
 
+def _resolver_threads() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("gambit-resolve") and thread.is_alive()
+    ]
+
+
+def _join_resolver_threads(timeout: float = 2.0) -> None:
+    """Wait out lookups left in ``getaddrinfo`` so they release their slot.
+
+    The resolver cap is process-wide. A sleeper from an earlier test still
+    occupies one slot, and on a slow scheduler that slot can free in the
+    middle of the next test.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        alive = _resolver_threads()
+        if not alive:
+            return
+        remaining = deadline - time.monotonic()
+        for thread in alive:
+            thread.join(min(0.1, max(0.0, remaining)))
+
+
 @pytest.fixture(autouse=True)
 def _clear_dns_cache():
     clear_resolution_cache()
     yield
     clear_resolution_cache()
+    _join_resolver_threads(2.0)
 
 
 def test_public_address_check_rejects_metadata_and_private_ranges():
@@ -65,21 +91,28 @@ def test_connect_resolves_with_a_deadline_then_dials_the_ip(monkeypatch):
 
 def test_resolve_ips_uses_one_deadline_for_every_family(monkeypatch):
     calls = []
+    release = threading.Event()
 
     def slow_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         calls.append(host)
-        time.sleep(1.0)
+        # One second unless the test is done. Leaving the thread in sleep
+        # would hold a resolver slot into the next test.
+        release.wait(1.0)
         return [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0)),
             (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700:4700::1111", 0, 0, 0)),
         ]
 
     monkeypatch.setattr(socket, "getaddrinfo", slow_getaddrinfo)
-    started = time.monotonic()
-    assert resolve_ips("example.com", 0.3) == []
-    elapsed = time.monotonic() - started
-    assert elapsed < 0.8
-    assert calls == ["example.com"]
+    try:
+        started = time.monotonic()
+        assert resolve_ips("example.com", 0.3) == []
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.8
+        assert calls == ["example.com"]
+    finally:
+        release.set()
+        _join_resolver_threads()
 
 
 def test_resolve_ips_localhost_uses_the_system_resolver():
@@ -160,7 +193,9 @@ def test_hanging_resolver_across_many_hosts_does_not_grow_threads(monkeypatch):
     def hang(host, port, family=0, type=0, proto=0, flags=0):
         with entered_lock:
             entered.append(host)
-        release.wait(10)
+        # Loop so a spurious wakeup cannot drop the slot mid-test.
+        while not release.is_set():
+            release.wait(0.2)
         return []
 
     monkeypatch.setattr(socket, "getaddrinfo", hang)
@@ -206,9 +241,9 @@ def test_hanging_resolver_across_many_hosts_does_not_grow_threads(monkeypatch):
             assert entered.count(hung_host) == before_count
     finally:
         release.set()
-        for thread in threading.enumerate():
-            if thread.name.startswith("gambit-resolve") and thread.ident not in before:
-                thread.join(2)
+        for caller in callers:
+            caller.join(2)
+        _join_resolver_threads(3)
 
 
 def test_transient_resolver_failure_is_not_cached(monkeypatch):
@@ -228,35 +263,59 @@ def test_transient_resolver_failure_is_not_cached(monkeypatch):
 
 
 def test_saturated_resolver_is_signalled_and_not_cached(monkeypatch, caplog):
+    # A lookup still running from an earlier test holds one shared slot.
+    # On Windows that straggler can finish between two probes and make the
+    # second probe look like a real lookup instead of a saturated skip.
+    _join_resolver_threads(2.0)
     release = threading.Event()
+    entered = []
+    entered_lock = threading.Lock()
+    full = threading.Event()
 
     def hang(host, port, family=0, type=0, proto=0, flags=0):
-        release.wait(10)
+        with entered_lock:
+            entered.append(host)
+            if len(entered) >= MAX_RESOLVER_THREADS:
+                full.set()
+        while not release.is_set():
+            release.wait(0.2)
         return []
 
+    def fill(prefix: str) -> list[threading.Thread]:
+        full.clear()
+        threads = [
+            threading.Thread(target=resolve_ips, args=(f"{prefix}-{index}.example", 5))
+            for index in range(MAX_RESOLVER_THREADS)
+        ]
+        for thread in threads:
+            thread.start()
+        assert full.wait(5), "resolver pool did not fill"
+        return threads
+
     monkeypatch.setattr(socket, "getaddrinfo", hang)
-    holders = [
-        threading.Thread(target=resolve_ips, args=(f"hold-{index}.example", 0.05))
-        for index in range(MAX_RESOLVER_THREADS)
-    ]
+    holders: list[threading.Thread] = []
     try:
-        for holder in holders:
-            holder.start()
-        for holder in holders:
-            holder.join(2)
-        assert all(not holder.is_alive() for holder in holders)
+        holders = fill("hold")
+        with entered_lock:
+            assert len(entered) >= MAX_RESOLVER_THREADS
         with caplog.at_level(logging.WARNING, logger="gambit.net"):
-            assert resolve_ips("healthy.example", 0.05) == []
+            assert resolve_ips("healthy.example", 0.3) == []
         assert resolution_saturated("healthy.example") is True
-        assert any("saturated" in record.message.lower() for record in caplog.records)
+        assert any(
+            "saturated" in record.message.lower() and "healthy.example" in record.message
+            for record in caplog.records
+        )
         assert any("not cached" in record.message.lower() for record in caplog.records)
-        assert resolve_ips("healthy.example", 0.05) == []
+        # The pool is still full, so this is another skip, not a cached miss.
+        assert resolve_ips("healthy.example", 0.3) == []
         assert resolution_saturated("healthy.example") is True
+        with entered_lock:
+            assert entered.count("healthy.example") == 0
     finally:
         release.set()
-        for thread in threading.enumerate():
-            if thread.name.startswith("gambit-resolve"):
-                thread.join(2)
+        for holder in holders:
+            holder.join(2)
+        _join_resolver_threads(2.0)
 
     def answer(host, port, family=0, type=0, proto=0, flags=0):
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.8", 0))]
@@ -264,26 +323,23 @@ def test_saturated_resolver_is_signalled_and_not_cached(monkeypatch, caplog):
     monkeypatch.setattr(socket, "getaddrinfo", answer)
     assert resolve_ips("healthy.example", 1) == ["198.51.100.8"]
     assert resolution_saturated("healthy.example") is False
+
     # connect distinguishes a full pool from an unresolvable name.
-    monkeypatch.setattr(socket, "getaddrinfo", hang)
     release.clear()
-    blockers = [
-        threading.Thread(target=resolve_ips, args=(f"block-{index}.example", 0.05))
-        for index in range(MAX_RESOLVER_THREADS)
-    ]
+    with entered_lock:
+        entered.clear()
+    monkeypatch.setattr(socket, "getaddrinfo", hang)
+    blockers: list[threading.Thread] = []
     try:
-        for blocker in blockers:
-            blocker.start()
-        for blocker in blockers:
-            blocker.join(2)
+        blockers = fill("block")
         with pytest.raises(ResolverSaturated):
-            connect("again.example", 80, 0.05)
+            connect("again.example", 80, 0.3)
         assert resolution_saturated("again.example") is True
     finally:
         release.set()
-        for thread in threading.enumerate():
-            if thread.name.startswith("gambit-resolve"):
-                thread.join(2)
+        for blocker in blockers:
+            blocker.join(2)
+        _join_resolver_threads(2.0)
 
 
 def test_slow_burst_finishes_inside_one_deadline(monkeypatch):

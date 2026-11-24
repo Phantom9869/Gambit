@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import gambit.__main__ as cli
 from gambit.models import Severity
 from gambit.modules import gather, takeover
@@ -117,3 +119,41 @@ def test_main_ctrl_c_during_scan_is_quiet(monkeypatch, capsys):
     assert "Scan interrupted." in captured.err
     assert "Traceback" not in captured.err
     assert "Traceback" not in captured.out
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["", "   ", "https://", "https:///path", "file://"],
+)
+def test_main_rejects_an_empty_target(target, monkeypatch, capsys):
+    def should_not_run(*_args, **_kwargs):
+        raise AssertionError("scan should not start for an empty target")
+
+    monkeypatch.setattr(cli, "collect_findings", should_not_run)
+    # --yes would otherwise skip the prompt; the target must still be rejected.
+    assert cli.main([target, "--yes"]) == 1
+    captured = capsys.readouterr()
+    assert "required" in captured.err.lower()
+    assert "Traceback" not in captured.err
+
+
+def test_authorization_prompt_uses_the_normalized_host(monkeypatch, capsys):
+    seen = {}
+
+    def fake_input(prompt=""):
+        seen["prompt"] = prompt
+        return "n"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    monkeypatch.setattr(
+        cli,
+        "collect_findings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("declined prompt should not start a scan")
+        ),
+    )
+    assert cli.main(["https://Example.COM/login"]) == 1
+    assert "example.com" in seen["prompt"]
+    assert "https://" not in seen["prompt"]
+    assert "login" not in seen["prompt"]
+    assert "authorization not confirmed" in capsys.readouterr().err

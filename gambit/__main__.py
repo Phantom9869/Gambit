@@ -29,6 +29,7 @@ from gambit.pipeline import (
     DEFAULT_MAX_HOSTS,
     discover_hosts,
     host_reachable,
+    normalize_host,
     run_for_host,
     run_pipeline,
 )
@@ -224,10 +225,15 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    host = normalize_host(args.target)
+    if not host:
+        print("A hostname, IP address, or URL is required.", file=sys.stderr)
+        return 1
+
     if not args.yes:
         try:
             answer = input(
-                f"Do you own {args.target} or have written permission to test it? [y/N] "
+                f"Do you own {host} or have written permission to test it? [y/N] "
             )
         except (EOFError, KeyboardInterrupt):
             print("\nAborting: authorization not confirmed.", file=sys.stderr)

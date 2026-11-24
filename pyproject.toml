@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["recon", "pentest", "security", "triage"]
 dependencies = [
-    "dnspython==2.8.0",
+    "dnspython==2.9.2",
     "requests==2.34.2",
     "urllib3==2.8.0",
 ]

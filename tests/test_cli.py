@@ -70,3 +70,50 @@ def test_main_prints_insecure_note(monkeypatch, capsys):
 def test_json_flag_is_kept_as_alias():
     args = cli.build_parser().parse_args(["example.com", "--json"])
     assert args.json is True
+
+
+def test_main_eof_on_prompt_is_quiet(monkeypatch, capsys):
+    def boom(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", boom)
+
+    def should_not_run(*_args, **_kwargs):
+        raise AssertionError("scan should not start without authorization")
+
+    monkeypatch.setattr(cli, "collect_findings", should_not_run)
+    assert cli.main(["example.com"]) == 1
+    captured = capsys.readouterr()
+    assert "authorization not confirmed" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+
+
+def test_main_ctrl_c_on_prompt_is_quiet(monkeypatch, capsys):
+    def boom(_prompt=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", boom)
+    monkeypatch.setattr(
+        cli,
+        "collect_findings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("scan should not start")
+        ),
+    )
+    assert cli.main(["example.com"]) == 1
+    captured = capsys.readouterr()
+    assert "authorization not confirmed" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_main_ctrl_c_during_scan_is_quiet(monkeypatch, capsys):
+    def boom(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "collect_findings", boom)
+    assert cli.main(["example.com", "--yes"]) == 1
+    captured = capsys.readouterr()
+    assert "Scan interrupted." in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out

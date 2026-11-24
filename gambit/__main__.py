@@ -225,9 +225,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if not args.yes:
-        answer = input(
-            f"Do you own {args.target} or have written permission to test it? [y/N] "
-        )
+        try:
+            answer = input(
+                f"Do you own {args.target} or have written permission to test it? [y/N] "
+            )
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborting: authorization not confirmed.", file=sys.stderr)
+            return 1
         if answer.strip().lower() not in ("y", "yes"):
             print("Aborting: authorization not confirmed.", file=sys.stderr)
             return 1
@@ -235,9 +239,13 @@ def main(argv=None) -> int:
     if args.insecure:
         print(INSECURE_NOTE, file=sys.stderr)
 
-    findings = collect_findings(
-        args.target, max_hosts=args.max_hosts, insecure=args.insecure
-    )
+    try:
+        findings = collect_findings(
+            args.target, max_hosts=args.max_hosts, insecure=args.insecure
+        )
+    except KeyboardInterrupt:
+        print("\nScan interrupted.", file=sys.stderr)
+        return 1
 
     report_format = "json" if args.json else args.format
     report = format_report(findings, report_format, insecure=args.insecure)
